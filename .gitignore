@@ -1,0 +1,9 @@
+ledger-engine-plan.md
+target/
+.idea/
+*.iml
+.vscode/
+loadtest/accounts.csv
+loadtest/report/
+*.jtl
+.env
