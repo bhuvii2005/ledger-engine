@@ -105,6 +105,40 @@ class AppendOnlyTriggerTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void deleteOnLedgerEntriesIsRejected() throws SQLException {
+        try (Connection c = dataSource.getConnection()) {
+            c.setAutoCommit(false);
+            UUID txnId = insertBalancedTransaction(c);
+            c.commit();
+
+            try (PreparedStatement ps = c.prepareStatement(
+                    "delete from ledger_entries where transaction_id = ?")) {
+                ps.setObject(1, txnId);
+                assertThatThrownBy(ps::executeUpdate)
+                        .isInstanceOf(SQLException.class)
+                        .hasMessageContaining("append-only");
+            }
+        }
+    }
+
+    @Test
+    void updateOnTransactionsIsRejected() throws SQLException {
+        try (Connection c = dataSource.getConnection()) {
+            c.setAutoCommit(false);
+            UUID txnId = insertBalancedTransaction(c);
+            c.commit();
+
+            try (PreparedStatement ps = c.prepareStatement(
+                    "update transactions set description = 'edited' where id = ?")) {
+                ps.setObject(1, txnId);
+                assertThatThrownBy(ps::executeUpdate)
+                        .isInstanceOf(SQLException.class)
+                        .hasMessageContaining("append-only");
+            }
+        }
+    }
+
+    @Test
     void truncateOnLedgerEntriesIsRejected() throws SQLException {
         try (Connection c = dataSource.getConnection()) {
             c.setAutoCommit(false);
@@ -113,6 +147,24 @@ class AppendOnlyTriggerTest extends AbstractIntegrationTest {
 
             try (Statement st = c.createStatement()) {
                 assertThatThrownBy(() -> st.execute("truncate ledger_entries"))
+                        .isInstanceOf(SQLException.class)
+                        .hasMessageContaining("append-only");
+            }
+        }
+    }
+
+    @Test
+    void truncateOnTransactionsIsRejected() throws SQLException {
+        try (Connection c = dataSource.getConnection()) {
+            c.setAutoCommit(false);
+            insertBalancedTransaction(c);
+            c.commit();
+
+            // plain TRUNCATE on transactions alone would hit the FK from
+            // ledger_entries first; CASCADE expands it to both tables so the
+            // append-only trigger (not the FK guard) is what actually fires.
+            try (Statement st = c.createStatement()) {
+                assertThatThrownBy(() -> st.execute("truncate transactions cascade"))
                         .isInstanceOf(SQLException.class)
                         .hasMessageContaining("append-only");
             }
