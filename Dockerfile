@@ -1,6 +1,5 @@
 FROM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /build
-RUN mkdir -p /root/.m2 && printf '<?xml version="1.0" encoding="UTF-8"?>\n<toolchains>\n  <toolchain>\n    <type>jdk</type>\n    <provides>\n      <version>21</version>\n      <vendor>temurin</vendor>\n    </provides>\n    <configuration>\n      <jdkHome>%s</jdkHome>\n    </configuration>\n  </toolchain>\n</toolchains>\n' "$JAVA_HOME" > /root/.m2/toolchains.xml
 COPY pom.xml .
 RUN mvn -B dependency:go-offline
 COPY src ./src
