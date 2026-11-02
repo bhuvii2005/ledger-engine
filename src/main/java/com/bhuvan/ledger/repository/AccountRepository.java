@@ -20,4 +20,7 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
     Optional<Account> lockById(@Param("id") Long id);
 
     Optional<Account> findByAccountNumber(String number); // read-only endpoints
+
+    @Query(value = "select nextval('account_number_seq')", nativeQuery = true)
+    long nextAccountNumber();
 }
