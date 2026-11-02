@@ -46,6 +46,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(ConcurrencyTest.class);
     private static final String SYSTEM_ACCOUNT = "SYS-CASH-0001";
+    private static final int DEADLOCK_BAIT_THREADS = 40;
 
     @Autowired
     private TransactionFacade facade;
@@ -94,42 +95,28 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         String b = accountWith(1_000_000);
         double retriesBefore = lockRetries();
 
+        // 200 opposite-direction transfers on 40 threads (5 each). Every transfer needs the same two
+        // row locks, so they run one at a time; 40 in flight keeps the queue for the 20-connection pool
+        // well inside Hikari's 3s connection-timeout. 200 threads at once would turn the tail of the
+        // queue into pool-wait 503s, which is a capacity limit, not what this test is about.
         List<Callable<PostingResult>> tasks = new ArrayList<>();
         for (int i = 0; i < 200; i++) {
             boolean aToB = i % 2 == 0;
             tasks.add(() -> facade.execute(transfer(aToB ? a : b, aToB ? b : a, 100))); // 1.00
         }
         long started = System.nanoTime();
-        List<Object> results = runAtOnce(tasks, 200);
+        Map<String, Integer> outcomes = tally(runAtOnce(tasks, DEADLOCK_BAIT_THREADS));
         long elapsedMs = (System.nanoTime() - started) / 1_000_000;
-        Map<String, Integer> outcomes = tally(results);
         double retries = lockRetries() - retriesBefore;
 
-        int aToBOk = 0;
-        int bToAOk = 0;
-        for (int i = 0; i < results.size(); i++) {
-            if (results.get(i) instanceof PostingResult p && p.isSuccess()) {
-                if (i % 2 == 0) {
-                    aToBOk++;
-                } else {
-                    bToAOk++;
-                }
-            }
-        }
-
-        log.info("RESULT deadlockBait: {} in {} ms ; A->B ok={} B->A ok={} ; A={} B={} ; "
-                + "ledger.lock.retries delta={}", outcomes, elapsedMs, aToBOk, bToAOk,
-                ledger.balance(a), ledger.balance(b), retries);
-
-        // Every transfer needs the same two row locks, so they run one at a time. With 200 at once
-        // and a 20-connection pool, the last few can wait longer than Hikari's 3s connection-timeout;
-        // the API turns that into 503 SYSTEM_BUSY. That is pool backpressure, not a lock failure,
-        // so it is the only non-201 outcome allowed here. No deadlock may surface at all.
-        assertThat(outcomes.keySet()).allMatch(k -> k.equals("201")
-                || k.equals("exception CannotCreateTransactionException"));
-        assertThat(outcomes.get("201")).isEqualTo(aToBOk + bToAOk);
-        assertThat(ledger.balance(a)).isEqualTo(1_000_000 - 100L * aToBOk + 100L * bToAOk);
-        assertThat(ledger.balance(a) + ledger.balance(b)).isEqualTo(2_000_000);
+        log.info("RESULT deadlockBait: {} on {} threads in {} ms ; A={} B={} ; ledger.lock.retries delta={}",
+                outcomes, DEADLOCK_BAIT_THREADS, elapsedMs, ledger.balance(a), ledger.balance(b), retries);
+        assertThat(outcomes).containsEntry("201", 200).hasSize(1);
+        // 100 each way, so both end exactly where they started
+        assertThat(ledger.balance(a)).isEqualTo(1_000_000);
+        assertThat(ledger.balance(b)).isEqualTo(1_000_000);
+        // a deadlock victim would have been retried; zero retries means zero deadlocks (and no lock timeouts)
+        assertThat(retries).isZero();
         ledger.assertHealthy(List.of(a, b));
     }
 
