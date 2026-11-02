@@ -55,6 +55,12 @@ management:
 
 ledger:
   max-transaction-amount-paise: 100000000
+  system-account-number: SYS-CASH-0001
+  posting:
+    # attempts per request when a lock times out or Postgres picks us as a deadlock victim
+    max-attempts: 3
+    # backoff before retry n is base * 2^(n-1) plus up to 25ms of jitter
+    retry-backoff-ms: 50
   reconciliation:
     scheduled-enabled: true
     interval-ms: 300000

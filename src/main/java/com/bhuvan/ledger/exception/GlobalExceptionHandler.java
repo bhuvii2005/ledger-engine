@@ -34,9 +34,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     @ExceptionHandler(LedgerException.class)
     public ResponseEntity<ProblemDetail> handleLedger(LedgerException ex) {
-        ProblemDetail body = problem(ex.getCode(), ex.getMessage());
-        ex.getProperties().forEach(body::setProperty);
-        return withRetryAfterIfNeeded(ex.getCode(), body);
+        return withRetryAfterIfNeeded(ex.getCode(), Problems.of(ex));
     }
 
     @ExceptionHandler({
@@ -46,7 +44,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleDatabaseBusy(Exception ex) {
         log.warn("Database busy or unavailable: {}", ex.getClass().getSimpleName());
         return withRetryAfterIfNeeded(ErrorCode.SYSTEM_BUSY,
-                problem(ErrorCode.SYSTEM_BUSY, "The system is busy, please retry shortly"));
+                Problems.of(ErrorCode.SYSTEM_BUSY, "The system is busy, please retry shortly"));
     }
 
     @ExceptionHandler(Exception.class)
@@ -56,7 +54,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
             correlationId = UUID.randomUUID().toString();
         }
         log.error("Unexpected error, correlationId={}", correlationId, ex);
-        ProblemDetail body = problem(ErrorCode.INTERNAL_ERROR,
+        ProblemDetail body = Problems.of(ErrorCode.INTERNAL_ERROR,
                 "Something went wrong. Quote the correlationId if you report this.");
         body.setProperty("correlationId", correlationId);
         return ResponseEntity.status(ErrorCode.INTERNAL_ERROR.status()).body(body);
@@ -68,7 +66,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         List<Map<String, String>> errors = ex.getBindingResult().getFieldErrors().stream()
                 .map(e -> Map.of("field", e.getField(), "message", String.valueOf(e.getDefaultMessage())))
                 .toList();
-        ProblemDetail body = problem(ErrorCode.VALIDATION_FAILED, "One or more fields are invalid");
+        ProblemDetail body = Problems.of(ErrorCode.VALIDATION_FAILED, "One or more fields are invalid");
         body.setProperty("errors", errors);
         return ResponseEntity.badRequest().body(body);
     }
@@ -79,7 +77,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         String detail = ex.getAllErrors().stream()
                 .map(e -> String.valueOf(e.getDefaultMessage()))
                 .collect(Collectors.joining("; "));
-        return ResponseEntity.badRequest().body(problem(ErrorCode.VALIDATION_FAILED, detail));
+        return ResponseEntity.badRequest().body(Problems.of(ErrorCode.VALIDATION_FAILED, detail));
     }
 
     @Override
@@ -87,14 +85,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
             HttpHeaders headers, HttpStatusCode status, WebRequest request) {
         String name = ex.getPropertyName() == null ? "parameter" : "'" + ex.getPropertyName() + "'";
         return ResponseEntity.badRequest()
-                .body(problem(ErrorCode.VALIDATION_FAILED, "Invalid value for " + name));
+                .body(Problems.of(ErrorCode.VALIDATION_FAILED, "Invalid value for " + name));
     }
 
     @Override
     protected ResponseEntity<Object> handleHttpMessageNotReadable(HttpMessageNotReadableException ex,
             HttpHeaders headers, HttpStatusCode status, WebRequest request) {
         return ResponseEntity.badRequest()
-                .body(problem(ErrorCode.MALFORMED_REQUEST, describeUnreadable(ex.getCause())));
+                .body(Problems.of(ErrorCode.MALFORMED_REQUEST, describeUnreadable(ex.getCause())));
     }
 
     // Spring's own handlers (unknown route, wrong method, wrong content type...) end up
@@ -147,13 +145,6 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
             return ErrorCode.UNSUPPORTED_MEDIA_TYPE;
         }
         return status.is5xxServerError() ? ErrorCode.INTERNAL_ERROR : ErrorCode.MALFORMED_REQUEST;
-    }
-
-    private static ProblemDetail problem(ErrorCode code, String detail) {
-        ProblemDetail body = ProblemDetail.forStatusAndDetail(code.status(), detail);
-        body.setTitle(code.title());
-        body.setProperty("code", code.name());
-        return body;
     }
 
     private static ResponseEntity<ProblemDetail> withRetryAfterIfNeeded(ErrorCode code, ProblemDetail body) {
