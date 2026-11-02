@@ -1,5 +1,6 @@
 package com.bhuvan.ledger.entity;
 
+import com.bhuvan.ledger.util.Timestamps;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -66,13 +67,13 @@ public class IdempotencyRecord {
 
     @PrePersist
     void onCreate() {
-        Instant now = Instant.now();
+        Instant now = Timestamps.now();
         this.createdAt = now;
         this.updatedAt = now;
     }
 
     @PreUpdate
     void onUpdate() {
-        this.updatedAt = Instant.now();
+        this.updatedAt = Timestamps.now();
     }
 }

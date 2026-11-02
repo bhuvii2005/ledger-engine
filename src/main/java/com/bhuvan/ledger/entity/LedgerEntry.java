@@ -1,5 +1,6 @@
 package com.bhuvan.ledger.entity;
 
+import com.bhuvan.ledger.util.Timestamps;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -53,6 +54,6 @@ public class LedgerEntry {
         this.direction = direction;
         this.amount = amount;
         this.balanceAfter = balanceAfter;
-        this.createdAt = Instant.now();
+        this.createdAt = Timestamps.now();
     }
 }

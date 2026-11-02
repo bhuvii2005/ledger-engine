@@ -183,6 +183,20 @@ class AccountApiTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void timestampsFromCreateMatchWhatALaterReadReturns() throws Exception {
+        String created = createAccount("Clock Check").andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        String number = JsonPath.read(created, "$.accountNumber");
+        String fetched = mockMvc.perform(get("/api/v1/accounts/" + number))
+                .andReturn().getResponse().getContentAsString();
+
+        assertThat((String) JsonPath.read(fetched, "$.createdAt"))
+                .isEqualTo(JsonPath.read(created, "$.createdAt"));
+        assertThat((String) JsonPath.read(fetched, "$.updatedAt"))
+                .isEqualTo(JsonPath.read(created, "$.updatedAt"));
+    }
+
+    @Test
     void getUnknownAccountIs404() throws Exception {
         mockMvc.perform(get("/api/v1/accounts/ACC9999999999"))
                 .andExpect(status().isNotFound())
