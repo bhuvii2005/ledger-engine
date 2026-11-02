@@ -28,6 +28,20 @@ class SwaggerUiTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void openApiDocumentListsTransactionEndpointsWithTheIdempotencyHeader() throws Exception {
+        for (String op : new String[] {"deposit", "withdraw", "transfer"}) {
+            String path = "$.paths['/api/v1/transactions/" + op + "'].post";
+            mockMvc.perform(get("/v3/api-docs"))
+                    .andExpect(jsonPath(path + ".parameters[?(@.name == 'Idempotency-Key')].in").value("header"))
+                    .andExpect(jsonPath(path + ".parameters[?(@.name == 'Idempotency-Key')].required").value(true))
+                    .andExpect(jsonPath(path + ".responses['201'].content['application/json'].schema.$ref")
+                            .value("#/components/schemas/TransactionResponse"));
+        }
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths['/api/v1/transactions/{transactionId}'].get").exists());
+    }
+
+    @Test
     void swaggerUiPageLoads() throws Exception {
         mockMvc.perform(get("/swagger-ui.html"))
                 .andExpect(status().is3xxRedirection())

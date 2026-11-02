@@ -18,8 +18,6 @@ import com.bhuvan.ledger.service.AccountService;
 import com.jayway.jsonpath.JsonPath;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -236,7 +234,7 @@ class AccountApiTest extends AbstractIntegrationTest {
     @Test
     void closeAccountWithBalanceIsRejected() throws Exception {
         String number = newAccount();
-        depositDirectly(number, 50_000);
+        moneyMove("deposit", number, "500.00").andExpect(status().isCreated());
 
         changeStatus(number, "CLOSED")
                 .andExpect(status().isUnprocessableEntity())
@@ -245,6 +243,14 @@ class AccountApiTest extends AbstractIntegrationTest {
         mockMvc.perform(get("/api/v1/accounts/" + number))
                 .andExpect(jsonPath("$.status").value("ACTIVE"))
                 .andExpect(jsonPath("$.balance").value("500.00"));
+    }
+
+    @Test
+    void accountCanBeClosedOnceItsBalanceIsWithdrawnToZero() throws Exception {
+        String number = newAccount();
+        moneyMove("deposit", number, "75.25").andExpect(status().isCreated());
+        moneyMove("withdraw", number, "75.25").andExpect(status().isCreated());
+        changeStatus(number, "CLOSED").andExpect(status().isOk()).andExpect(jsonPath("$.status").value("CLOSED"));
     }
 
     @Test
@@ -365,47 +371,10 @@ class AccountApiTest extends AbstractIntegrationTest {
                 .content("{\"status\":\"" + target + "\"}"));
     }
 
-    // There is no deposit endpoint until Phase 3, so post a complete, balanced deposit
-    // straight through JDBC: idempotency row, transaction, both legs, both balances.
-    private void depositDirectly(String accountNumber, long paise) throws SQLException {
-        try (Connection c = dataSource.getConnection()) {
-            c.setAutoCommit(false);
-            long[] system = lockAccount(c, SYSTEM_ACCOUNT);
-            long[] user = lockAccount(c, accountNumber);
-            UUID txnId = UUID.randomUUID();
-            String key = "test-" + txnId;
-
-            execute(c, "insert into idempotency_keys (idem_key, request_hash, operation, status, http_status, "
-                    + "transaction_id) values (?, ?, 'DEPOSIT', 'COMPLETED', 201, ?)", key, "0".repeat(64), txnId);
-            execute(c, "insert into transactions (id, txn_type, amount, idempotency_key) values (?, 'DEPOSIT', ?, ?)",
-                    txnId, paise, key);
-            execute(c, "insert into ledger_entries (transaction_id, account_id, direction, amount, balance_after) "
-                    + "values (?, ?, 'DEBIT', ?, ?)", txnId, system[0], paise, system[1] - paise);
-            execute(c, "insert into ledger_entries (transaction_id, account_id, direction, amount, balance_after) "
-                    + "values (?, ?, 'CREDIT', ?, ?)", txnId, user[0], paise, user[1] + paise);
-            execute(c, "update accounts set balance = ?, updated_at = now() where id = ?", system[1] - paise, system[0]);
-            execute(c, "update accounts set balance = ?, updated_at = now() where id = ?", user[1] + paise, user[0]);
-            c.commit();
-        }
-    }
-
-    private static long[] lockAccount(Connection c, String accountNumber) throws SQLException {
-        try (PreparedStatement ps = c.prepareStatement(
-                "select id, balance from accounts where account_number = ? for update")) {
-            ps.setString(1, accountNumber);
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                return new long[] {rs.getLong(1), rs.getLong(2)};
-            }
-        }
-    }
-
-    private static void execute(Connection c, String sql, Object... params) throws SQLException {
-        try (PreparedStatement ps = c.prepareStatement(sql)) {
-            for (int i = 0; i < params.length; i++) {
-                ps.setObject(i + 1, params[i]);
-            }
-            ps.executeUpdate();
-        }
+    private ResultActions moneyMove(String operation, String accountNumber, String amount) throws Exception {
+        return mockMvc.perform(post("/api/v1/transactions/" + operation)
+                .header("Idempotency-Key", "acct-test-" + UUID.randomUUID())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"accountNumber\":\"" + accountNumber + "\",\"amount\":\"" + amount + "\"}"));
     }
 }
