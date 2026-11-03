@@ -31,7 +31,9 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      # a dead or hung Redis costs a request at most this long before it falls back to Postgres
       timeout: 200ms
+      connect-timeout: 200ms
 
   jackson:
     deserialization:
@@ -49,9 +51,10 @@ management:
   endpoint:
     health:
       show-details: always
-  health:
-    redis:
-      enabled: true
+      status:
+        # Redis only speeds up idempotency checks, so its DEGRADED status ranks below UP
+        # and never turns the overall status DOWN. Postgres being down still does.
+        order: DOWN,OUT_OF_SERVICE,UP,DEGRADED,UNKNOWN
 
 ledger:
   max-transaction-amount-paise: 100000000
@@ -61,6 +64,13 @@ ledger:
     max-attempts: 3
     # backoff before retry n is base * 2^(n-1) plus up to 25ms of jitter
     retry-backoff-ms: 50
+  idempotency:
+    # must outlive one posting with all its retries: 3 x 2s lock_timeout + backoff < 10s
+    in-progress-ttl: 10s
+    completed-ttl: 24h
+    # after a Redis error, skip Redis for this long so requests don't each wait out a timeout
+    redis-skip-after-failure: 1s
+    redis-warn-interval: 1m
   reconciliation:
     scheduled-enabled: true
     interval-ms: 300000
