@@ -5,6 +5,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import com.bhuvan.ledger.AbstractIntegrationTest;
 import com.bhuvan.ledger.LedgerInvariants;
+import com.bhuvan.ledger.entity.AccountStatus;
 import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.exception.LedgerException;
 import com.bhuvan.ledger.service.AccountService;
@@ -15,6 +16,7 @@ import com.jayway.jsonpath.JsonPath;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -27,6 +29,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -41,7 +45,7 @@ import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
- * Concurrency tests 1-5 from the plan. Each one releases all threads at once with a latch,
+ * Concurrency tests 1-7 from the plan. Each one releases all threads at once with a latch,
  * then checks money was conserved and the ledger is consistent. Test 5 stops the Redis
  * container and starts it again before it returns.
  */
@@ -285,6 +289,95 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         ledger.assertHealthy(List.of(a, b));
     }
 
+    @Test
+    @Timeout(60)
+    void freezeRace() throws Exception {
+        String a = accountWith(100_000); // 1,000.00
+        String b = accountWith(0);
+        AtomicInteger succeeded = new AtomicInteger();
+        // set once the freeze has committed; a transfer that starts after that must be refused
+        AtomicLong frozenAtNanos = new AtomicLong(Long.MAX_VALUE);
+        List<Integer> statusesStartedAfterFreeze = Collections.synchronizedList(new ArrayList<>());
+
+        ExecutorService pool = Executors.newFixedThreadPool(10);
+        List<Future<PostingResult>> futures = new ArrayList<>();
+        try {
+            for (int i = 0; i < 100; i++) {
+                futures.add(pool.submit(() -> {
+                    boolean afterFreeze = System.nanoTime() > frozenAtNanos.get();
+                    PostingResult r = facade.execute(transfer(a, b, 100)); // 1.00
+                    if (r.httpStatus() == 201) {
+                        succeeded.incrementAndGet();
+                    }
+                    if (afterFreeze) {
+                        statusesStartedAfterFreeze.add(r.httpStatus());
+                    }
+                    return r;
+                }));
+            }
+            // freeze A mid-way, while transfers out of it are queued on its row lock
+            while (succeeded.get() < 20) {
+                Thread.sleep(1);
+            }
+            accountService.changeStatus(a, AccountStatus.FROZEN);
+            frozenAtNanos.set(System.nanoTime());
+            int entriesAtFreeze = entriesOn(a);
+
+            List<Object> results = new ArrayList<>();
+            for (Future<PostingResult> f : futures) {
+                try {
+                    results.add(f.get(50, TimeUnit.SECONDS));
+                } catch (ExecutionException e) {
+                    results.add(e.getCause());
+                }
+            }
+            Map<String, Integer> outcomes = tally(results);
+            int entriesAtEnd = entriesOn(a);
+
+            log.info("RESULT freezeRace: {} ; entries on A when the freeze committed={} at the end={} ; "
+                    + "transfers started after the freeze={} ; final A={} B={}", outcomes, entriesAtFreeze,
+                    entriesAtEnd, statusesStartedAfterFreeze.size(), ledger.balance(a), ledger.balance(b));
+            assertThat(outcomes.keySet()).containsOnly("201", "422 ACCOUNT_NOT_ACTIVE");
+            assertThat(outcomes.get("201")).isBetween(20, 99);
+            // every posting that got A's lock before the freeze had committed before the freeze got it;
+            // nothing touched A after the freeze committed
+            assertThat(entriesAtEnd).isEqualTo(entriesAtFreeze);
+            assertThat(statusesStartedAfterFreeze).isNotEmpty().allMatch(status -> status == 422);
+            assertThat(ledger.balance(a)).isEqualTo(100_000 - 100L * outcomes.get("201"));
+            assertThat(ledger.balance(b)).isEqualTo(100L * outcomes.get("201"));
+            ledger.assertHealthy(List.of(a, b));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void concurrentReversal() throws Exception {
+        String a = accountWith(100_000);
+        String b = accountWith(0);
+        PostingResult original = facade.execute(transfer(a, b, 40_000)); // 400.00
+        assertThat(original.httpStatus()).isEqualTo(201);
+
+        // 10 different keys, so idempotency can't merge them: only the row lock on the original can
+        List<Callable<PostingResult>> tasks = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            tasks.add(() -> facade.execute(PostingCommand.of(TransactionType.REVERSAL, newKey(), null, null, 0,
+                    "INR", "dispute", original.transactionId())));
+        }
+        Map<String, Integer> outcomes = tally(runAtOnce(tasks, 10));
+        int reversals = jdbc.queryForObject("select count(*) from transactions where reverses_txn_id = ?",
+                Integer.class, original.transactionId());
+
+        log.info("RESULT concurrentReversal: {} ; REVERSAL rows={} ; final A={} B={}", outcomes, reversals,
+                ledger.balance(a), ledger.balance(b));
+        assertThat(outcomes).containsEntry("201", 1).containsEntry("409 ALREADY_REVERSED", 9).hasSize(2);
+        assertThat(reversals).isEqualTo(1);
+        assertThat(ledger.balance(a)).isEqualTo(100_000);
+        assertThat(ledger.balance(b)).isZero();
+        ledger.assertHealthy(List.of(a, b));
+    }
+
     // ---------- helpers ----------
 
     private String accountWith(long paise) {
@@ -384,6 +477,10 @@ class ConcurrencyTest extends AbstractIntegrationTest {
                 select count(*) from ledger_entries e join accounts a on a.id = e.account_id
                  where a.account_number = ?
                 """, Integer.class, acc);
+    }
+
+    private int entriesOn(String acc) {
+        return transactionsOn(acc);
     }
 
     private int transactionsWithKey(PostingCommand cmd) {

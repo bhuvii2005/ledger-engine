@@ -17,12 +17,15 @@ import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.exception.ErrorCode;
 import com.bhuvan.ledger.exception.LedgerException;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.sql.SQLException;
 import java.util.Optional;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.dao.QueryTimeoutException;
 
@@ -166,6 +169,44 @@ class TransactionFacadeTest {
 
         assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(LedgerException.class);
         verify(postingService, times(1)).post(cmd);
+    }
+
+    @Test
+    void secondReversalHittingTheUniqueConstraintIsA409AlreadyReversed() {
+        UUID originalId = UUID.randomUUID();
+        PostingCommand reversal = PostingCommand.of(TransactionType.REVERSAL, "key-87654321", null, null, 0,
+                "INR", null, originalId);
+        when(postingService.post(any())).thenThrow(uniqueViolation("transactions_reverses_txn_id_key"));
+
+        assertThatThrownBy(() -> facade.execute(reversal))
+                .isInstanceOfSatisfying(LedgerException.class, e -> {
+                    assertThat(e.getCode()).isEqualTo(ErrorCode.ALREADY_REVERSED);
+                    assertThat(e.getProperties()).containsEntry("transactionId", originalId);
+                });
+        verify(postingService, times(1)).post(reversal);
+        verify(cache).clearInProgress(reversal, "marker");
+    }
+
+    @Test
+    void otherConstraintViolationsAreNotDisguisedAsAlreadyReversed() {
+        PostingCommand reversal = PostingCommand.of(TransactionType.REVERSAL, "key-87654321", null, null, 0,
+                "INR", null, UUID.randomUUID());
+        when(postingService.post(any())).thenThrow(uniqueViolation("transactions_idempotency_key_key"));
+
+        assertThatThrownBy(() -> facade.execute(reversal)).isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void reversalConstraintNameOnANonReversalIsRethrownAsIs() {
+        when(postingService.post(any())).thenThrow(uniqueViolation("transactions_reverses_txn_id_key"));
+
+        assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    private static DataIntegrityViolationException uniqueViolation(String constraint) {
+        return new DataIntegrityViolationException("duplicate key", new ConstraintViolationException(
+                "duplicate key", new SQLException("duplicate key value violates unique constraint", "23505"),
+                constraint));
     }
 
     private double retries() {

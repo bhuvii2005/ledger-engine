@@ -1,14 +1,26 @@
 package com.bhuvan.ledger.service;
 
 import com.bhuvan.ledger.dto.AccountResponse;
+import com.bhuvan.ledger.dto.StatementResponse;
 import com.bhuvan.ledger.entity.Account;
 import com.bhuvan.ledger.entity.AccountStatus;
 import com.bhuvan.ledger.entity.AccountType;
+import com.bhuvan.ledger.entity.LedgerEntry;
+import com.bhuvan.ledger.entity.LedgerTransaction;
 import com.bhuvan.ledger.exception.ErrorCode;
 import com.bhuvan.ledger.exception.LedgerException;
 import com.bhuvan.ledger.repository.AccountRepository;
+import com.bhuvan.ledger.repository.LedgerEntryRepository;
+import com.bhuvan.ledger.repository.LedgerTransactionRepository;
+import com.bhuvan.ledger.util.Money;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,6 +30,8 @@ import org.springframework.transaction.annotation.Transactional;
 public class AccountService {
 
     private final AccountRepository accountRepository;
+    private final LedgerEntryRepository entryRepository;
+    private final LedgerTransactionRepository transactionRepository;
 
     @Transactional
     public AccountResponse create(String ownerName) {
@@ -37,6 +51,35 @@ public class AccountService {
         return accountRepository.findByAccountNumber(accountNumber)
                 .map(AccountResponse::from)
                 .orElseThrow(() -> LedgerException.accountNotFound(accountNumber));
+    }
+
+    /**
+     * Keyset pagination on entry id, newest first. Unlike OFFSET, a page boundary doesn't
+     * shift when new entries arrive, so paging through never repeats or skips an entry.
+     */
+    @Transactional(readOnly = true)
+    public StatementResponse statement(String accountNumber, int limit, Long beforeId) {
+        Long accountId = accountRepository.findIdByAccountNumber(accountNumber)
+                .orElseThrow(() -> LedgerException.accountNotFound(accountNumber));
+
+        // one extra row tells us whether there is an older page, without a count query
+        List<LedgerEntry> rows = entryRepository.findPage(accountId,
+                beforeId == null ? Long.MAX_VALUE : beforeId, PageRequest.of(0, limit + 1));
+        boolean more = rows.size() > limit;
+        List<LedgerEntry> page = more ? rows.subList(0, limit) : rows;
+
+        Map<UUID, LedgerTransaction> transactions = transactionRepository
+                .findAllById(page.stream().map(LedgerEntry::getTransactionId).distinct().toList())
+                .stream()
+                .collect(Collectors.toMap(LedgerTransaction::getId, Function.identity()));
+
+        List<StatementResponse.Entry> entries = page.stream().map(e -> {
+            LedgerTransaction txn = transactions.get(e.getTransactionId());
+            return new StatementResponse.Entry(e.getId(), e.getTransactionId(), txn.getTxnType().name(),
+                    e.getDirection().name(), Money.format(e.getAmount()), Money.format(e.getBalanceAfter()),
+                    txn.getDescription(), e.getCreatedAt());
+        }).toList();
+        return new StatementResponse(accountNumber, entries, more ? page.get(page.size() - 1).getId() : null);
     }
 
     @Transactional

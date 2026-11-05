@@ -1,5 +1,6 @@
 package com.bhuvan.ledger.service;
 
+import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.exception.ErrorCode;
 import com.bhuvan.ledger.exception.LedgerException;
 import io.micrometer.core.instrument.Counter;
@@ -8,6 +9,8 @@ import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
@@ -20,6 +23,9 @@ import org.springframework.stereotype.Service;
 @Slf4j
 @Service
 public class TransactionFacade {
+
+    // Postgres' default name for UNIQUE (reverses_txn_id) on transactions
+    static final String ONE_REVERSAL_PER_TRANSACTION = "transactions_reverses_txn_id_key";
 
     private final PostingService postingService;
     private final IdempotencyCache idempotencyCache;
@@ -83,8 +89,32 @@ public class TransactionFacade {
                 log.warn("Lock failure on {} key={} attempt {}/{}: {}", cmd.operation(),
                         cmd.idempotencyKey(), attempt, maxAttempts, e.getClass().getSimpleName());
                 sleepBeforeRetry(attempt);
+            } catch (DataIntegrityViolationException e) {
+                if (isSecondReversal(cmd, e)) {
+                    // The row lock on the original should make this unreachable. If it fires, the
+                    // database still kept the ledger right, but the locking logic is broken.
+                    log.error("Second reversal of {} reached the unique constraint (key={}); "
+                            + "the row lock did not serialize it", cmd.reversesTxnId(), cmd.idempotencyKey(), e);
+                    throw new LedgerException(ErrorCode.ALREADY_REVERSED,
+                            "Transaction " + cmd.reversesTxnId() + " has already been reversed", e)
+                            .with("transactionId", cmd.reversesTxnId());
+                }
+                throw e;
             }
         }
+    }
+
+    private static boolean isSecondReversal(PostingCommand cmd, DataIntegrityViolationException e) {
+        if (cmd.operation() != TransactionType.REVERSAL) {
+            return false;
+        }
+        for (Throwable c = e; c != null; c = c.getCause()) {
+            if (c instanceof ConstraintViolationException cve
+                    && ONE_REVERSAL_PER_TRANSACTION.equalsIgnoreCase(cve.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void sleepBeforeRetry(int attempt) {
