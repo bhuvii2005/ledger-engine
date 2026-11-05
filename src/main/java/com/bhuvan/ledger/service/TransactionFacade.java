@@ -45,15 +45,23 @@ public class TransactionFacade {
             return cached.get();
         }
 
-        boolean markedInProgress = idempotencyCache.tryMarkInProgress(cmd);
+        Optional<String> marker = idempotencyCache.tryMarkInProgress(cmd);
+        if (marker.isEmpty()) {
+            // Either another request with this key marked it between our lookup and SET NX
+            // (look again: 409 or a replay), or Redis is unavailable (lookup is a miss again
+            // and we go to Postgres, which serializes duplicates on the key's unique index).
+            cached = idempotencyCache.lookup(cmd);
+            if (cached.isPresent()) {
+                return cached.get();
+            }
+        }
         try {
             PostingResult result = postWithRetry(cmd);
             idempotencyCache.storeCompleted(cmd, result); // the DB transaction has committed by now
             return result;
         } catch (RuntimeException e) {
-            if (markedInProgress) {
-                idempotencyCache.clearInProgress(cmd);
-            }
+            // this request committed nothing, so let the next attempt in straight away
+            marker.ifPresent(m -> idempotencyCache.clearInProgress(cmd, m));
             throw e;
         }
     }

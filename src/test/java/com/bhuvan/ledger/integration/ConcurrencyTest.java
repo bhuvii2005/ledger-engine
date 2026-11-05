@@ -13,6 +13,7 @@ import com.bhuvan.ledger.service.PostingResult;
 import com.bhuvan.ledger.service.TransactionFacade;
 import com.jayway.jsonpath.JsonPath;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,15 +33,17 @@ import org.junit.jupiter.api.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
- * Concurrency tests 1-4 from the plan, DB-only (the Redis cache is still a no-op).
- * Each one releases all threads at once with a latch, then checks money was conserved
- * and the ledger is consistent.
+ * Concurrency tests 1-5 from the plan. Each one releases all threads at once with a latch,
+ * then checks money was conserved and the ledger is consistent. Test 5 stops the Redis
+ * container and starts it again before it returns.
  */
 class ConcurrencyTest extends AbstractIntegrationTest {
 
@@ -62,6 +65,12 @@ class ConcurrencyTest extends AbstractIntegrationTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    @Value("${ledger.idempotency.redis-skip-after-failure}")
+    private Duration cacheSkipWindow;
 
     private LedgerInvariants ledger;
 
@@ -163,23 +172,19 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         }
         List<Object> results = runAtOnce(tasks, 50);
         Map<String, Integer> outcomes = tally(results);
+        StormSummary summary = StormSummary.of(results);
 
-        long originals = results.stream().filter(r -> r instanceof PostingResult p && !p.replayed()).count();
-        long replays = results.stream().filter(r -> r instanceof PostingResult p && p.replayed()).count();
-        long distinctIds = results.stream().filter(r -> r instanceof PostingResult)
-                .map(r -> ((PostingResult) r).transactionId()).distinct().count();
-        long distinctBodies = results.stream().filter(r -> r instanceof PostingResult)
-                .map(r -> ((PostingResult) r).body()).distinct().count();
-
-        log.info("RESULT sameKeyStorm: {} ; originals={} replays={} distinctTransactionIds={} "
-                + "transactionRows={}", outcomes, originals, replays, distinctIds, transactionsWithKey(same));
-        // Without Redis, the other 49 block on the key's unique index until the first commits,
-        // then read the stored row and replay it. (The 409 REQUEST_IN_PROGRESS path needs Redis.)
-        assertThat(outcomes).containsEntry("201", 50).hasSize(1);
-        assertThat(originals).isEqualTo(1);
-        assertThat(replays).isEqualTo(49);
-        assertThat(distinctIds).isEqualTo(1);
-        assertThat(distinctBodies).isEqualTo(1);
+        log.info("RESULT sameKeyStorm (Redis up): {} ; originals={} replays={} distinctTransactionIds={} "
+                + "transactionRows={}", outcomes, summary.originals(), summary.replays(), summary.distinctIds(),
+                transactionsWithKey(same));
+        // One request wins SET NX and posts. The rest see its IN_PROGRESS marker (409) or, if they
+        // arrive after it committed, its COMPLETED entry (201 replayed from Redis).
+        assertThat(outcomes.keySet()).containsOnly("201", "exception REQUEST_IN_PROGRESS");
+        assertThat(outcomes.get("201") + outcomes.getOrDefault("exception REQUEST_IN_PROGRESS", 0)).isEqualTo(50);
+        assertThat(outcomes.getOrDefault("exception REQUEST_IN_PROGRESS", 0)).isPositive();
+        assertThat(summary.originals()).isEqualTo(1);
+        assertThat(summary.distinctIds()).isEqualTo(1);
+        assertThat(summary.distinctBodies()).isEqualTo(1);
         assertThat(transactionsWithKey(same)).isEqualTo(1);
         assertThat(ledger.balance(a)).isEqualTo(99_000);
         assertThat(ledger.balance(b)).isEqualTo(1_000);
@@ -206,25 +211,77 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         Map<String, Integer> statuses = new TreeMap<>();
         List<String> ids = new ArrayList<>();
         int replayed = 0;
+        int proper409s = 0;
         for (Object r : results) {
             if (r instanceof MockHttpServletResponse resp) {
                 statuses.merge(String.valueOf(resp.getStatus()), 1, Integer::sum);
-                ids.add(JsonPath.read(resp.getContentAsString(), "$.transactionId"));
-                if ("true".equals(resp.getHeader("Idempotent-Replayed"))) {
-                    replayed++;
+                if (resp.getStatus() == 201) {
+                    ids.add(JsonPath.read(resp.getContentAsString(), "$.transactionId"));
+                    if ("true".equals(resp.getHeader("Idempotent-Replayed"))) {
+                        replayed++;
+                    }
+                } else if (resp.getStatus() == 409 && "1".equals(resp.getHeader("Retry-After"))
+                        && "REQUEST_IN_PROGRESS".equals(JsonPath.read(resp.getContentAsString(), "$.code"))) {
+                    proper409s++;
                 }
             } else {
                 statuses.merge("exception " + ((Throwable) r).getClass().getSimpleName(), 1, Integer::sum);
             }
         }
 
-        log.info("RESULT sameKeyStormThroughHttp: {} ; replayed header on {} ; distinct ids {}",
+        log.info("RESULT sameKeyStormThroughHttp (Redis up): {} ; replayed header on {} ; distinct ids {}",
                 statuses, replayed, ids.stream().distinct().count());
-        assertThat(statuses).containsEntry("201", 50).hasSize(1);
-        assertThat(replayed).isEqualTo(49);
+        assertThat(statuses.keySet()).containsOnly("201", "409");
+        // every 409 is REQUEST_IN_PROGRESS with Retry-After: 1
+        assertThat(proper409s).isEqualTo(statuses.getOrDefault("409", 0));
+        assertThat(replayed).isEqualTo(statuses.get("201") - 1);
         assertThat(ids.stream().distinct().count()).isEqualTo(1);
         assertThat(jdbc.queryForObject("select count(*) from transactions where idempotency_key = ?",
                 Integer.class, key)).isEqualTo(1);
+        ledger.assertHealthy(List.of(a, b));
+    }
+
+    @Test
+    @Timeout(120)
+    void sameKeyStormWithRedisStopped() throws Exception {
+        String a = accountWith(100_000);
+        String b = accountWith(0);
+        PostingCommand same = transfer(a, b, 1_000);
+        double failuresBefore = redisFailures();
+
+        stopRedis();
+        List<Object> results;
+        long elapsedMs;
+        try {
+            List<Callable<PostingResult>> tasks = new ArrayList<>();
+            for (int i = 0; i < 50; i++) {
+                tasks.add(() -> facade.execute(same));
+            }
+            long started = System.nanoTime();
+            results = runAtOnce(tasks, 50);
+            elapsedMs = (System.nanoTime() - started) / 1_000_000;
+        } finally {
+            startRedis(redis, cacheSkipWindow);
+        }
+        Map<String, Integer> outcomes = tally(results);
+        StormSummary summary = StormSummary.of(results);
+        double failures = redisFailures() - failuresBefore;
+
+        log.info("RESULT sameKeyStorm (Redis stopped): {} in {} ms ; originals={} replays={} "
+                + "distinctTransactionIds={} transactionRows={} ; ledger.redis.failures delta={}", outcomes,
+                elapsedMs, summary.originals(), summary.replays(), summary.distinctIds(), transactionsWithKey(same),
+                failures);
+        // No Redis, so no 409s: the other 49 block on the key's unique index in Postgres until
+        // the first commits, then replay its stored row.
+        assertThat(outcomes).containsEntry("201", 50).hasSize(1);
+        assertThat(summary.originals()).isEqualTo(1);
+        assertThat(summary.replays()).isEqualTo(49);
+        assertThat(summary.distinctIds()).isEqualTo(1);
+        assertThat(summary.distinctBodies()).isEqualTo(1);
+        assertThat(transactionsWithKey(same)).isEqualTo(1);
+        assertThat(failures).isPositive();
+        assertThat(ledger.balance(a)).isEqualTo(99_000);
+        assertThat(ledger.balance(b)).isEqualTo(1_000);
         ledger.assertHealthy(List.of(a, b));
     }
 
@@ -300,6 +357,22 @@ class ConcurrencyTest extends AbstractIntegrationTest {
             counts.merge(label, 1, Integer::sum);
         }
         return counts;
+    }
+
+    private record StormSummary(long originals, long replays, long distinctIds, long distinctBodies) {
+        static StormSummary of(List<Object> results) {
+            List<PostingResult> ok = results.stream()
+                    .filter(r -> r instanceof PostingResult).map(r -> (PostingResult) r).toList();
+            return new StormSummary(
+                    ok.stream().filter(p -> !p.replayed()).count(),
+                    ok.stream().filter(PostingResult::replayed).count(),
+                    ok.stream().map(PostingResult::transactionId).distinct().count(),
+                    ok.stream().map(PostingResult::body).distinct().count());
+        }
+    }
+
+    private double redisFailures() {
+        return meterRegistry.counter("ledger.redis.failures").count();
     }
 
     private double lockRetries() {
