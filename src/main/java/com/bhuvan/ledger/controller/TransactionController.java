@@ -1,6 +1,7 @@
 package com.bhuvan.ledger.controller;
 
 import com.bhuvan.ledger.dto.CashRequest;
+import com.bhuvan.ledger.dto.ReverseRequest;
 import com.bhuvan.ledger.dto.TransactionDetailsResponse;
 import com.bhuvan.ledger.dto.TransactionResponse;
 import com.bhuvan.ledger.dto.TransferRequest;
@@ -84,6 +85,20 @@ public class TransactionController {
         return post(PostingCommand.of(TransactionType.TRANSFER, requireKey(key),
                 request.fromAccount(), request.toAccount(), Money.parse(request.amount()),
                 request.currency(), request.description(), null));
+    }
+
+    // No "consumes": the body is optional, so a bare POST with no Content-Type is fine.
+    // A body sent with a non-JSON content type still gets 415.
+    @PostMapping("/{transactionId}/reverse")
+    @CreatedTransaction
+    public ResponseEntity<String> reverse(
+            @IdempotencyKeyHeader @RequestHeader(name = IDEMPOTENCY_KEY, required = false) String key,
+            @PathVariable UUID transactionId,
+            @Valid @RequestBody(required = false) ReverseRequest request) {
+        String reason = request == null ? null : request.reason();
+        // accounts and amount come from the original transaction, so the request is just (id, reason)
+        return post(PostingCommand.of(TransactionType.REVERSAL, requireKey(key),
+                null, null, 0, "INR", reason, transactionId));
     }
 
     @GetMapping("/{transactionId}")

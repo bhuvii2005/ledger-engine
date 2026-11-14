@@ -2,9 +2,12 @@ package com.bhuvan.ledger.controller;
 
 import com.bhuvan.ledger.dto.AccountResponse;
 import com.bhuvan.ledger.dto.CreateAccountRequest;
+import com.bhuvan.ledger.dto.StatementResponse;
 import com.bhuvan.ledger.dto.UpdateAccountStatusRequest;
 import com.bhuvan.ledger.service.AccountService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import java.net.URI;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
@@ -15,6 +18,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -33,6 +37,16 @@ public class AccountController {
     @GetMapping("/{accountNumber}")
     public AccountResponse get(@PathVariable String accountNumber) {
         return accountService.get(accountNumber);
+    }
+
+    @GetMapping("/{accountNumber}/entries")
+    public StatementResponse entries(@PathVariable String accountNumber,
+            @RequestParam(defaultValue = "20")
+            @Min(value = 1, message = "limit must be between 1 and 100")
+            @Max(value = 100, message = "limit must be between 1 and 100") int limit,
+            @RequestParam(required = false)
+            @Min(value = 1, message = "beforeId must be a positive entry id") Long beforeId) {
+        return accountService.statement(accountNumber, limit, beforeId);
     }
 
     @PatchMapping(path = "/{accountNumber}/status", consumes = MediaType.APPLICATION_JSON_VALUE)

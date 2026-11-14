@@ -15,10 +15,13 @@ import com.bhuvan.ledger.exception.LedgerException;
 import com.bhuvan.ledger.exception.Problems;
 import com.bhuvan.ledger.repository.AccountRepository;
 import com.bhuvan.ledger.repository.IdempotencyRecordRepository;
+import com.bhuvan.ledger.repository.LedgerEntryRepository;
+import com.bhuvan.ledger.repository.LedgerTransactionRepository;
 import com.bhuvan.ledger.util.Money;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManager;
+import java.util.List;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,8 +31,9 @@ import org.springframework.transaction.annotation.Transactional;
 /**
  * Posts one money movement inside a single DB transaction: claim the idempotency
  * key, lock both accounts in id order, validate, write the transaction and both
- * entries, update balances, record the response. Retries live in TransactionFacade,
- * outside this transaction.
+ * entries, update balances, record the response. A reversal first locks the original
+ * transaction and then runs the same flow with its accounts swapped. Retries live in
+ * TransactionFacade, outside this transaction.
  */
 @Slf4j
 @Service
@@ -37,17 +41,23 @@ public class PostingService {
 
     private final AccountRepository accountRepository;
     private final IdempotencyRecordRepository idempotencyRepository;
+    private final LedgerTransactionRepository transactionRepository;
+    private final LedgerEntryRepository entryRepository;
     private final EntityManager entityManager;
     private final ObjectMapper objectMapper;
     private final long maxAmountPaise;
 
     public PostingService(AccountRepository accountRepository,
             IdempotencyRecordRepository idempotencyRepository,
+            LedgerTransactionRepository transactionRepository,
+            LedgerEntryRepository entryRepository,
             EntityManager entityManager,
             ObjectMapper objectMapper,
             @Value("${ledger.max-transaction-amount-paise}") long maxAmountPaise) {
         this.accountRepository = accountRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.transactionRepository = transactionRepository;
+        this.entryRepository = entryRepository;
         this.entityManager = entityManager;
         this.objectMapper = objectMapper;
         this.maxAmountPaise = maxAmountPaise;
@@ -67,8 +77,9 @@ public class PostingService {
             TransactionResponse response = execute(cmd);
             String body = toJson(response);
             complete(record, 201, body, response.transactionId());
-            log.info("Posted {} txnId={} amountPaise={} from={} to={}", cmd.operation(),
-                    response.transactionId(), cmd.amountPaise(), cmd.sourceAccountNumber(), cmd.destAccountNumber());
+            log.info("Posted {} txnId={} amount={} from={} to={}{}", cmd.operation(),
+                    response.transactionId(), response.amount(), response.fromAccount(),
+                    response.toAccount(), cmd.reversesTxnId() == null ? "" : " reverses=" + cmd.reversesTxnId());
             return new PostingResult(201, body, response.transactionId(), false);
         } catch (LedgerException rejection) {
             // A business "no" is a final answer for this key: store it and commit, so a retry
@@ -98,6 +109,9 @@ public class PostingService {
     }
 
     private TransactionResponse execute(PostingCommand cmd) {
+        if (cmd.operation() == TransactionType.REVERSAL) {
+            return reverse(cmd);
+        }
         if (!"INR".equals(cmd.currency())) {
             throw new LedgerException(ErrorCode.CURRENCY_NOT_SUPPORTED,
                     "Currency " + cmd.currency() + " is not supported; only INR is")
@@ -110,7 +124,34 @@ public class PostingService {
         if (sourceId.equals(destId)) {
             throw sameAccount(cmd);
         }
+        return move(cmd, sourceId, destId, cmd.amountPaise());
+    }
 
+    private TransactionResponse reverse(PostingCommand cmd) {
+        UUID originalId = cmd.reversesTxnId();
+        // Lock the original first: a second reversal of the same transaction waits here until
+        // this one commits, then sees the REVERSAL row below and gets ALREADY_REVERSED.
+        LedgerTransaction original = transactionRepository.lockById(originalId)
+                .orElseThrow(() -> new LedgerException(ErrorCode.TRANSACTION_NOT_FOUND,
+                        "No transaction with id " + originalId).with("transactionId", originalId));
+        if (original.getTxnType() == TransactionType.REVERSAL) {
+            throw new LedgerException(ErrorCode.CANNOT_REVERSE_REVERSAL,
+                    "Transaction " + originalId + " is itself a reversal and cannot be reversed")
+                    .with("transactionId", originalId);
+        }
+        if (transactionRepository.existsByReversesTxnId(originalId)) {
+            throw new LedgerException(ErrorCode.ALREADY_REVERSED,
+                    "Transaction " + originalId + " has already been reversed").with("transactionId", originalId);
+        }
+
+        List<LedgerEntry> entries = entryRepository.findByTransactionIdOrderByIdAsc(originalId);
+        Long originallyDebited = accountOf(entries, Direction.DEBIT, originalId);
+        Long originallyCredited = accountOf(entries, Direction.CREDIT, originalId);
+        // the money goes back: whoever received it is debited now
+        return move(cmd, originallyCredited, originallyDebited, original.getAmount());
+    }
+
+    private TransactionResponse move(PostingCommand cmd, Long sourceId, Long destId, long amount) {
         // Always lock the smaller id first. A->B and B->A then queue on the same row
         // instead of each holding one lock and waiting for the other (deadlock).
         Account first = lock(Math.min(sourceId, destId));
@@ -118,16 +159,16 @@ public class PostingService {
         Account source = sourceId < destId ? first : second;
         Account dest = sourceId < destId ? second : first;
 
-        validate(cmd, source, dest);
+        validate(cmd, source, dest, amount);
 
-        long sourceAfter = Money.subtract(source.getBalance(), cmd.amountPaise());
-        long destAfter = Money.add(dest.getBalance(), cmd.amountPaise());
+        long sourceAfter = Money.subtract(source.getBalance(), amount);
+        long destAfter = Money.add(dest.getBalance(), amount);
 
         LedgerTransaction txn = LedgerTransaction.builder()
                 .id(UUID.randomUUID())
                 .txnType(cmd.operation())
-                .amount(cmd.amountPaise())
-                .currency(cmd.currency())
+                .amount(amount)
+                .currency("INR")
                 .description(cmd.description())
                 .idempotencyKey(cmd.idempotencyKey())
                 .reversesTxnId(cmd.reversesTxnId())
@@ -135,21 +176,29 @@ public class PostingService {
         // persist, not repository.save: the id is assigned, so save() would merge and SELECT first
         entityManager.persist(txn);
         entityManager.persist(LedgerEntry.builder().transactionId(txn.getId()).accountId(source.getId())
-                .direction(Direction.DEBIT).amount(cmd.amountPaise()).balanceAfter(sourceAfter).build());
+                .direction(Direction.DEBIT).amount(amount).balanceAfter(sourceAfter).build());
         entityManager.persist(LedgerEntry.builder().transactionId(txn.getId()).accountId(dest.getId())
-                .direction(Direction.CREDIT).amount(cmd.amountPaise()).balanceAfter(destAfter).build());
+                .direction(Direction.CREDIT).amount(amount).balanceAfter(destAfter).build());
 
         // managed and locked; dirty checking writes these on flush
         source.setBalance(sourceAfter);
         dest.setBalance(destAfter);
 
-        return new TransactionResponse(txn.getId(), cmd.operation().name(), Money.format(cmd.amountPaise()),
-                cmd.currency(), source.getAccountNumber(), dest.getAccountNumber(),
+        return new TransactionResponse(txn.getId(), cmd.operation().name(), Money.format(amount),
+                txn.getCurrency(), source.getAccountNumber(), dest.getAccountNumber(),
                 Money.format(sourceAfter), Money.format(destAfter), cmd.reversesTxnId(), txn.getCreatedAt());
     }
 
+    private static Long accountOf(List<LedgerEntry> entries, Direction direction, UUID transactionId) {
+        return entries.stream().filter(e -> e.getDirection() == direction).findFirst()
+                .map(LedgerEntry::getAccountId)
+                // the balance trigger makes a transaction without both legs impossible to commit
+                .orElseThrow(() -> new IllegalStateException("Transaction " + transactionId + " has no "
+                        + direction + " entry"));
+    }
+
     // Runs after both locks are held, so status and balance can't change underneath us.
-    private void validate(PostingCommand cmd, Account source, Account dest) {
+    private void validate(PostingCommand cmd, Account source, Account dest, long amount) {
         if (requestNamesSource(cmd.operation())) {
             requireUserAccount(source);
         }
@@ -158,12 +207,12 @@ public class PostingService {
         }
         requireActive(source);
         requireActive(dest);
-        if (source.getAccountType() == AccountType.USER && source.getBalance() < cmd.amountPaise()) {
+        if (source.getAccountType() == AccountType.USER && source.getBalance() < amount) {
             throw new LedgerException(ErrorCode.INSUFFICIENT_FUNDS,
                     "Account " + source.getAccountNumber() + " has insufficient funds")
                     .with("accountNumber", source.getAccountNumber());
         }
-        if (cmd.amountPaise() > maxAmountPaise) {
+        if (amount > maxAmountPaise) {
             throw new LedgerException(ErrorCode.AMOUNT_LIMIT_EXCEEDED,
                     "Amount exceeds the per-transaction limit of " + Money.format(maxAmountPaise))
                     .with("limit", Money.format(maxAmountPaise));
