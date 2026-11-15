@@ -76,17 +76,19 @@ public class TransactionFacade {
             return cached.get();
         }
 
-        Optional<String> marker = idempotencyCache.tryMarkInProgress(cmd);
-        if (marker.isEmpty()) {
-            // Either another request with this key marked it between our lookup and SET NX
-            // (look again: 409 or a replay), or Redis is unavailable (lookup is a miss again
-            // and we go to Postgres, which serializes duplicates on the key's unique index).
+        IdempotencyCache.Claim claim = idempotencyCache.tryMarkInProgress(cmd);
+        if (claim.outcome() == IdempotencyCache.Claim.Outcome.TAKEN) {
+            // another request with this key marked it (or finished) between our lookup and
+            // SET NX: look again for its answer (409 while in flight, 422 or a replay)
             cached = idempotencyCache.lookup(cmd);
             if (cached.isPresent()) {
                 countReplay("redis");
                 return cached.get();
             }
         }
+        // CLAIMED: we hold the key. MISS: Redis can't say, so no second lookup (it could only
+        // find our own marker) and Postgres serializes duplicates on the key's unique index.
+        Optional<String> marker = claim.ownMarker();
         try {
             PostingResult result = postWithRetry(cmd);
             if (result.replayed()) {

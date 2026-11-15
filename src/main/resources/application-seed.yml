@@ -1,0 +1,14 @@
+# One-shot data load for the JMeter runs: ./mvnw package, then
+#   DB_PORT=<compose postgres host port> java -jar target/ledger-engine-0.1.0.jar --spring.profiles.active=seed
+spring:
+  main:
+    web-application-type: none
+
+ledger:
+  reconciliation:
+    scheduled-enabled: false
+  seed:
+    accounts: 1000
+    # 1,00,000.00 each
+    deposit-paise: 10000000
+    output: loadtest/accounts.csv

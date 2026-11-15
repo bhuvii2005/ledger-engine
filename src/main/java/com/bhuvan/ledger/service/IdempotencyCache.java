@@ -86,16 +86,54 @@ public class IdempotencyCache {
     }
 
     /**
-     * SET NX with a short TTL. Returns the marker that was written, or empty if the key already
-     * existed or Redis is unavailable. The TTL only has to outlive one posting with all its
-     * retries; if it expires early nothing breaks, Postgres still guards the key.
+     * SET NX with a short TTL. The TTL only has to outlive one posting with all its retries; if
+     * it expires early nothing breaks, Postgres still guards the key.
+     *
+     * <p>A SET NX that errors or times out may still have been applied: Redis ran it and only
+     * the reply was lost. So after an error the key is read back once. If it holds the marker
+     * this call wrote (same owner token), the key is ours. Treating it as someone else's would
+     * answer 409 to a request that was only ever sent once.
      */
-    public Optional<String> tryMarkInProgress(PostingCommand cmd) {
-        String marker = toJson(new Entry(Entry.IN_PROGRESS, cmd.requestHash(), UUID.randomUUID().toString(),
-                null, null, null));
-        Optional<Boolean> set = safely("mark",
-                () -> Optional.ofNullable(redis.opsForValue().setIfAbsent(key(cmd), marker, inProgressTtl)));
-        return set.orElse(false) ? Optional.of(marker) : Optional.empty();
+    public Claim tryMarkInProgress(PostingCommand cmd) {
+        String owner = UUID.randomUUID().toString();
+        String marker = toJson(new Entry(Entry.IN_PROGRESS, cmd.requestHash(), owner, null, null, null));
+        long now = System.currentTimeMillis();
+        if (now < skipUntil.get()) {
+            return Claim.MISS;
+        }
+        try {
+            Boolean set = redis.opsForValue().setIfAbsent(key(cmd), marker, inProgressTtl);
+            return Boolean.TRUE.equals(set) ? Claim.claimed(marker) : Claim.TAKEN;
+        } catch (RuntimeException e) {
+            recordFailure("mark", e, now);
+            return checkOwnMarker(cmd, owner, marker);
+        }
+    }
+
+    // Runs straight after a failed SET NX, so it deliberately ignores the skip window that
+    // failure has just opened: one read decides whether this request already holds the key.
+    private Claim checkOwnMarker(PostingCommand cmd, String owner, String marker) {
+        Optional<Entry> current;
+        try {
+            current = read(cmd.idempotencyKey());
+        } catch (RuntimeException e) {
+            recordFailure("mark check", e, System.currentTimeMillis());
+            return Claim.MISS; // can't tell: no marker, Postgres decides
+        }
+        // Redis answered, so the failure was transient. Close the skip window again so that
+        // storeCompleted or clearInProgress for this request reach Redis instead of being
+        // skipped and leaving the marker behind for its full TTL.
+        skipUntil.set(0);
+        if (current.isEmpty()) {
+            return Claim.MISS; // the SET was not applied (or the value is unreadable)
+        }
+        Entry entry = current.get();
+        if (Entry.IN_PROGRESS.equals(entry.state()) && owner.equals(entry.owner())) {
+            log.info("SET NX for key {} failed but had been applied; continuing as its owner",
+                    cmd.idempotencyKey());
+            return Claim.claimed(marker);
+        }
+        return Claim.TAKEN; // another request's marker or a completed entry: lookup decides
     }
 
     /** Called only after PostingService has returned, so the DB transaction has committed. */
@@ -137,11 +175,15 @@ public class IdempotencyCache {
         try {
             return call.get();
         } catch (RuntimeException e) {
-            failures.increment();
-            skipUntil.set(now + skipAfterFailureMs);
-            warnAtMostOncePerInterval(operation, e, now);
+            recordFailure(operation, e, now);
             return Optional.empty();
         }
+    }
+
+    private void recordFailure(String operation, RuntimeException e, long now) {
+        failures.increment();
+        skipUntil.set(now + skipAfterFailureMs);
+        warnAtMostOncePerInterval(operation, e, now);
     }
 
     private void warnAtMostOncePerInterval(String operation, RuntimeException e, long now) {
@@ -164,6 +206,28 @@ public class IdempotencyCache {
             return objectMapper.writeValueAsString(entry);
         } catch (Exception e) {
             throw new IllegalStateException("Could not serialize idempotency entry", e);
+        }
+    }
+
+    /**
+     * Outcome of {@link #tryMarkInProgress}. CLAIMED: this request holds the key and carries
+     * the marker it wrote. TAKEN: another request's marker or a completed entry is there, so
+     * look it up again. MISS: Redis can't say (down, skipped, or the SET was not applied), so
+     * carry on unmarked and let Postgres serialize duplicates on the key's unique index.
+     */
+    public record Claim(Outcome outcome, String marker) {
+
+        public enum Outcome { CLAIMED, TAKEN, MISS }
+
+        public static final Claim TAKEN = new Claim(Outcome.TAKEN, null);
+        public static final Claim MISS = new Claim(Outcome.MISS, null);
+
+        public static Claim claimed(String marker) {
+            return new Claim(Outcome.CLAIMED, marker);
+        }
+
+        public Optional<String> ownMarker() {
+            return Optional.ofNullable(marker);
         }
     }
 

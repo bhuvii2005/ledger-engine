@@ -1,0 +1,8 @@
+# Overlay for the hot-pair diagnostic run: GC and safepoint logging on, scheduled reconciliation off.
+#   docker compose -f docker-compose.yml -f loadtest/compose-diagnostic.yml up -d app
+# Copy the GC log out afterwards with: docker compose cp app:/tmp/gc.log <dest>
+services:
+  app:
+    environment:
+      LEDGER_RECONCILIATION_SCHEDULEDENABLED: "false"
+      JAVA_TOOL_OPTIONS: "-Xlog:gc*,safepoint:file=/tmp/gc.log:utctime,uptime,level,tags"
