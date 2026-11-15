@@ -7,6 +7,7 @@ import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.CannotCreateTransactionException;
 
 class GlobalExceptionHandlerTest {
 
@@ -45,5 +46,18 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
         assertThat(response.getBody().getProperties()).containsEntry("code", "SYSTEM_BUSY");
         assertThat(response.getBody().getDetail()).doesNotContain("lock on row");
+    }
+
+    @Test
+    void databaseUnreachableBecomes503WithoutLeakingTheCause() {
+        // what Spring throws when no connection can be opened (Postgres down, or the pool timed out)
+        ResponseEntity<ProblemDetail> response = handler.handleDatabaseBusy(new CannotCreateTransactionException(
+                "Could not open JPA EntityManager for transaction",
+                new IllegalStateException("Connection to postgres:5432 refused")));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(503);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
+        assertThat(response.getBody().getProperties()).containsEntry("code", "SYSTEM_BUSY");
+        assertThat(response.getBody().getDetail()).doesNotContain("postgres").doesNotContain("EntityManager");
     }
 }

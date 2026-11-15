@@ -434,6 +434,18 @@ class TransactionApiTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void transferWithBothAccountsUnknownIs404ForTheSourceAndIsStored() throws Exception {
+        String k = key();
+        transfer(k, "ACC9999999996", "ACC9999999995", "1.00", "INR", null)
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"))
+                .andExpect(jsonPath("$.accountNumber").value("ACC9999999996"));
+        assertThat(transactionsWithKey(k)).isZero();
+        assertThat(jdbc.queryForObject("select http_status from idempotency_keys where idem_key = ?",
+                Integer.class, k)).isEqualTo(404);
+    }
+
+    @Test
     void transferToSelfIs422() throws Exception {
         String acc = newAccountWith("10.00");
         transfer(key(), acc, acc, "1.00", "INR", null)
@@ -481,6 +493,23 @@ class TransactionApiTest extends AbstractIntegrationTest {
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_ACTIVE"))
                 .andExpect(jsonPath("$.status").value("CLOSED"));
+    }
+
+    @Test
+    void transferFromAClosedSourceIs422AndNothingMoves() throws Exception {
+        String closed = newAccount(); // zero balance, so it can be closed
+        String other = newAccountWith("10.00");
+        accountService.changeStatus(closed, AccountStatus.CLOSED);
+        String k = key();
+
+        transfer(k, closed, other, "1.00", "INR", null)
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_ACTIVE"))
+                .andExpect(jsonPath("$.accountNumber").value(closed))
+                .andExpect(jsonPath("$.status").value("CLOSED"));
+        assertThat(transactionsWithKey(k)).isZero();
+        assertThat(balancePaise(closed)).isZero();
+        assertThat(balancePaise(other)).isEqualTo(1_000);
     }
 
     @Test
