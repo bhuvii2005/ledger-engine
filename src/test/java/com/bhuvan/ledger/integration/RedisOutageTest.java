@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import com.bhuvan.ledger.AbstractIntegrationTest;
 import com.bhuvan.ledger.LedgerInvariants;
 import com.bhuvan.ledger.service.AccountService;
+import com.bhuvan.ledger.service.ReconciliationService;
 import com.jayway.jsonpath.JsonPath;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
@@ -41,6 +42,9 @@ class RedisOutageTest extends AbstractIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbc;
+
+    @Autowired
+    private ReconciliationService reconciliation;
 
     @Autowired
     private MeterRegistry meterRegistry;
@@ -91,7 +95,7 @@ class RedisOutageTest extends AbstractIntegrationTest {
         assertThat(replay.getHeader("Idempotent-Replayed")).isEqualTo("true"); // from Postgres
         assertThat(jdbc.queryForObject("select balance from accounts where account_number = ?", Long.class, acc))
                 .isEqualTo(2_000);
-        new LedgerInvariants(jdbc).assertHealthy(List.of(acc));
+        new LedgerInvariants(jdbc, reconciliation).assertHealthy();
     }
 
     @Test

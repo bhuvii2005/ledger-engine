@@ -12,6 +12,7 @@ import com.bhuvan.ledger.AbstractIntegrationTest;
 import com.bhuvan.ledger.LedgerInvariants;
 import com.bhuvan.ledger.entity.AccountStatus;
 import com.bhuvan.ledger.service.AccountService;
+import com.bhuvan.ledger.service.ReconciliationService;
 import com.jayway.jsonpath.JsonPath;
 import java.util.List;
 import java.util.UUID;
@@ -36,11 +37,14 @@ class ReversalApiTest extends AbstractIntegrationTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private ReconciliationService reconciliation;
+
     private LedgerInvariants ledger;
 
     @BeforeEach
     void setUp() {
-        ledger = new LedgerInvariants(jdbc);
+        ledger = new LedgerInvariants(jdbc, reconciliation);
     }
 
     // ---------- happy paths ----------
@@ -85,7 +89,7 @@ class ReversalApiTest extends AbstractIntegrationTest {
                 .andExpect(jsonPath("$.type").value("TRANSFER"))
                 .andExpect(jsonPath("$.reversesTransactionId").isEmpty())
                 .andExpect(jsonPath("$.entries[0].accountNumber").value(from));
-        ledger.assertHealthy(List.of(from, to));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -113,7 +117,7 @@ class ReversalApiTest extends AbstractIntegrationTest {
 
         assertThat(ledger.balance(acc)).isZero();
         assertThat(ledger.balance(SYSTEM_ACCOUNT)).isEqualTo(systemBefore + 25_000);
-        ledger.assertHealthy(List.of(acc));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -126,7 +130,7 @@ class ReversalApiTest extends AbstractIntegrationTest {
                 .andExpect(jsonPath("$.fromAccount").value(SYSTEM_ACCOUNT))
                 .andExpect(jsonPath("$.toAccount").value(acc))
                 .andExpect(jsonPath("$.toBalanceAfter").value("100.00"));
-        ledger.assertHealthy(List.of(acc));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -205,7 +209,7 @@ class ReversalApiTest extends AbstractIntegrationTest {
         deposit(key(), acc, "60.00").andExpect(status().isCreated());
         reverse(key(), original, null).andExpect(status().isCreated());
         assertThat(ledger.balance(acc)).isZero();
-        ledger.assertHealthy(List.of(acc, other));
+        ledger.assertHealthy();
     }
 
     @Test

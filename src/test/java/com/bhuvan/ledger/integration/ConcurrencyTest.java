@@ -9,6 +9,7 @@ import com.bhuvan.ledger.entity.AccountStatus;
 import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.exception.LedgerException;
 import com.bhuvan.ledger.service.AccountService;
+import com.bhuvan.ledger.service.ReconciliationService;
 import com.bhuvan.ledger.service.PostingCommand;
 import com.bhuvan.ledger.service.PostingResult;
 import com.bhuvan.ledger.service.TransactionFacade;
@@ -65,6 +66,9 @@ class ConcurrencyTest extends AbstractIntegrationTest {
     private JdbcTemplate jdbc;
 
     @Autowired
+    private ReconciliationService reconciliation;
+
+    @Autowired
     private MeterRegistry meterRegistry;
 
     @Autowired
@@ -80,7 +84,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        ledger = new LedgerInvariants(jdbc);
+        ledger = new LedgerInvariants(jdbc, reconciliation);
     }
 
     @Test
@@ -98,7 +102,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(outcomes).containsEntry("201", 10).containsEntry("422 INSUFFICIENT_FUNDS", 40).hasSize(2);
         assertThat(ledger.balance(acc)).isZero();
         assertThat(transactionsOn(acc)).isEqualTo(11); // the opening deposit + 10 withdrawals
-        ledger.assertHealthy(List.of(acc));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -130,7 +134,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(ledger.balance(b)).isEqualTo(1_000_000);
         // a deadlock victim would have been retried; zero retries means zero deadlocks (and no lock timeouts)
         assertThat(retries).isZero();
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -160,7 +164,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(outcomes.values().stream().mapToInt(Integer::intValue).sum()).isEqualTo(2_000);
         assertThat(totalAfter).isEqualTo(totalBefore);
         assertThat(accounts).allMatch(acc -> ledger.balance(acc) >= 0);
-        ledger.assertHealthy(accounts);
+        ledger.assertHealthy();
     }
 
     @Test
@@ -192,7 +196,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(transactionsWithKey(same)).isEqualTo(1);
         assertThat(ledger.balance(a)).isEqualTo(99_000);
         assertThat(ledger.balance(b)).isEqualTo(1_000);
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -242,7 +246,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(ids.stream().distinct().count()).isEqualTo(1);
         assertThat(jdbc.queryForObject("select count(*) from transactions where idempotency_key = ?",
                 Integer.class, key)).isEqualTo(1);
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -286,7 +290,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(failures).isPositive();
         assertThat(ledger.balance(a)).isEqualTo(99_000);
         assertThat(ledger.balance(b)).isEqualTo(1_000);
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     @Test
@@ -345,7 +349,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
             assertThat(statusesStartedAfterFreeze).isNotEmpty().allMatch(status -> status == 422);
             assertThat(ledger.balance(a)).isEqualTo(100_000 - 100L * outcomes.get("201"));
             assertThat(ledger.balance(b)).isEqualTo(100L * outcomes.get("201"));
-            ledger.assertHealthy(List.of(a, b));
+            ledger.assertHealthy();
         } finally {
             pool.shutdownNow();
         }
@@ -375,7 +379,7 @@ class ConcurrencyTest extends AbstractIntegrationTest {
         assertThat(reversals).isEqualTo(1);
         assertThat(ledger.balance(a)).isEqualTo(100_000);
         assertThat(ledger.balance(b)).isZero();
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     // ---------- helpers ----------

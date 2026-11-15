@@ -562,11 +562,15 @@ class TransactionApiTest extends AbstractIntegrationTest {
         String k = key();
         jdbc.update("update accounts set balance = ? where account_number = ?", Long.MAX_VALUE - 50, acc);
         try {
-            deposit(k, acc, "1.00", null)
+            var response = deposit(k, acc, "1.00", null)
                     .andExpect(status().isInternalServerError())
                     .andExpect(jsonPath("$.code").value("INTERNAL_ERROR"))
                     .andExpect(jsonPath("$.correlationId").exists())
-                    .andExpect(content().string(not(containsString("Arithmetic"))));
+                    .andExpect(content().string(not(containsString("Arithmetic"))))
+                    .andReturn().getResponse();
+            // the id quoted to the client is the one on the request's log lines
+            assertThat((String) JsonPath.read(response.getContentAsString(), "$.correlationId"))
+                    .isEqualTo(response.getHeader("X-Correlation-Id"));
             assertThat(transactionsWithKey(k)).isZero();
             assertThat(jdbc.queryForObject("select count(*) from idempotency_keys where idem_key = ?",
                     Integer.class, k)).isZero();
