@@ -9,6 +9,7 @@ import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.service.AccountService;
 import com.bhuvan.ledger.service.ReconciliationService;
 import com.bhuvan.ledger.service.IdempotencyCache;
+import com.bhuvan.ledger.service.IdempotencyCache.Claim.Outcome;
 import com.bhuvan.ledger.service.PostingCommand;
 import com.bhuvan.ledger.service.PostingResult;
 import com.bhuvan.ledger.service.PostingService;
@@ -20,7 +21,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.persistence.EntityManagerFactory;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.hibernate.SessionFactory;
@@ -147,7 +147,7 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
     @Test
     void inProgressMarkerGives409WithRetryAfterAndPostsNothing() throws Exception {
         String key = newKey();
-        assertThat(cache.tryMarkInProgress(transferCommand(key, a, b, 1_000))).isPresent();
+        assertThat(cache.tryMarkInProgress(transferCommand(key, a, b, 1_000)).outcome()).isEqualTo(Outcome.CLAIMED);
 
         MockHttpServletResponse response = transfer(key, a, b, "10.00");
 
@@ -163,7 +163,7 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
     @Test
     void sameKeyWithADifferentBodyIsRejectedFromRedisWhileInProgress() throws Exception {
         String key = newKey();
-        assertThat(cache.tryMarkInProgress(transferCommand(key, a, b, 1_000))).isPresent();
+        assertThat(cache.tryMarkInProgress(transferCommand(key, a, b, 1_000)).outcome()).isEqualTo(Outcome.CLAIMED);
 
         MockHttpServletResponse response = transfer(key, a, b, "20.00");
 
@@ -213,21 +213,21 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
     void inProgressMarkerIsSetNxWithATenSecondTtl() {
         PostingCommand cmd = transferCommand(newKey(), a, b, 1_000);
 
-        Optional<String> marker = cache.tryMarkInProgress(cmd);
+        IdempotencyCache.Claim marker = cache.tryMarkInProgress(cmd);
 
-        assertThat(marker).isPresent();
+        assertThat(marker.outcome()).isEqualTo(Outcome.CLAIMED);
         assertThat(redis.getExpire(redisKey(cmd.idempotencyKey()), TimeUnit.MILLISECONDS)).isBetween(9_000L, 10_000L);
-        assertThat(cache.tryMarkInProgress(cmd)).isEmpty(); // NX: the second one loses
+        assertThat(cache.tryMarkInProgress(cmd)).isEqualTo(IdempotencyCache.Claim.TAKEN); // NX: the second one loses
     }
 
     @Test
     void clearingRemovesOnlyTheMarkerThisRequestWrote() throws Exception {
         PostingCommand cmd = transferCommand(newKey(), a, b, 1_000);
-        String mine = cache.tryMarkInProgress(cmd).orElseThrow();
+        String mine = cache.tryMarkInProgress(cmd).ownMarker().orElseThrow();
 
         // my marker expired and another request with the same key marked it again
         redis.delete(redisKey(cmd.idempotencyKey()));
-        String theirs = cache.tryMarkInProgress(cmd).orElseThrow();
+        String theirs = cache.tryMarkInProgress(cmd).ownMarker().orElseThrow();
         assertThat(theirs).isNotEqualTo(mine);
 
         cache.clearInProgress(cmd, mine);
@@ -280,7 +280,7 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
         // What the facade does, minus the last step: mark IN_PROGRESS, post and commit, then
         // "crash" before storeCompleted. Redis is left holding the marker with its real 10s TTL.
         long markedAt = System.nanoTime();
-        assertThat(cache.tryMarkInProgress(cmd)).isPresent();
+        assertThat(cache.tryMarkInProgress(cmd).outcome()).isEqualTo(Outcome.CLAIMED);
         PostingResult committed = postingService.post(cmd);
         assertThat(committed.httpStatus()).isEqualTo(201);
 

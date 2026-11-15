@@ -47,7 +47,7 @@ class TransactionFacadeTest {
     void setUp() {
         facade = new TransactionFacade(postingService, cache, registry, 3, 0);
         when(cache.lookup(any())).thenReturn(Optional.empty());
-        when(cache.tryMarkInProgress(any())).thenReturn(Optional.of("marker"));
+        when(cache.tryMarkInProgress(any())).thenReturn(IdempotencyCache.Claim.claimed("marker"));
     }
 
     @Test
@@ -94,7 +94,7 @@ class TransactionFacadeTest {
 
     @Test
     void losingTheSetNxRaceLooksAgainAndReturnsTheWinnersAnswer() {
-        when(cache.tryMarkInProgress(cmd)).thenReturn(Optional.empty());
+        when(cache.tryMarkInProgress(cmd)).thenReturn(IdempotencyCache.Claim.TAKEN);
         when(cache.lookup(cmd))
                 .thenReturn(Optional.empty())
                 .thenThrow(new LedgerException(ErrorCode.REQUEST_IN_PROGRESS, "busy"));
@@ -107,13 +107,27 @@ class TransactionFacadeTest {
 
     @Test
     void withRedisUnavailableItPostsThroughPostgresAndClearsNothing() {
-        // lookup misses and SET NX "fails": exactly what IdempotencyCache returns when Redis is down
-        when(cache.tryMarkInProgress(cmd)).thenReturn(Optional.empty());
+        // lookup misses and SET NX gives MISS: what IdempotencyCache returns when Redis is down
+        when(cache.tryMarkInProgress(cmd)).thenReturn(IdempotencyCache.Claim.MISS);
         when(postingService.post(cmd)).thenThrow(new PessimisticLockingFailureException("lock timeout"));
 
         assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(LedgerException.class);
         verify(cache, never()).clearInProgress(any(), anyString());
         verify(cache, never()).storeCompleted(any(), any());
+    }
+
+    @Test
+    void aMissDoesNotLookAgainBecauseThatCouldOnlyFindOurOwnMarker() {
+        // the second lookup is what turned a lost SET NX reply into a 409 for the request itself
+        when(cache.tryMarkInProgress(cmd)).thenReturn(IdempotencyCache.Claim.MISS);
+        when(cache.lookup(cmd))
+                .thenReturn(Optional.empty())
+                .thenThrow(new LedgerException(ErrorCode.REQUEST_IN_PROGRESS, "own marker"));
+        when(postingService.post(cmd)).thenReturn(ok);
+
+        assertThat(facade.execute(cmd)).isEqualTo(ok);
+        verify(cache, times(1)).lookup(cmd);
+        verify(cache).storeCompleted(cmd, ok);
     }
 
     @Test
@@ -234,7 +248,7 @@ class TransactionFacadeTest {
 
     @Test
     void replayAfterLosingTheSetNxRaceIsStillSourceRedis() {
-        when(cache.tryMarkInProgress(cmd)).thenReturn(Optional.empty());
+        when(cache.tryMarkInProgress(cmd)).thenReturn(IdempotencyCache.Claim.TAKEN);
         when(cache.lookup(cmd))
                 .thenReturn(Optional.empty())
                 .thenReturn(Optional.of(new PostingResult(201, "{}", UUID.randomUUID(), true)));
