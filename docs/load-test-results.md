@@ -122,8 +122,129 @@ CPU comes from `docker stats` every 5s; 1 core = 100%. The server-side means cov
 - Other candidates: a stall of the WSL2 VM (Windows had little free memory), or the reconciliation scan competing with a fully serialized workload.
 - Pinning it down needs a rerun of the hot-pair scenario with GC logging, the scheduled reconciliation off, and per-second sampling. That would be a different configuration from the runs reported here.
 
+## Additional runs
+
+Two more runs were made after the results above had been reviewed. They are reported separately here, and nothing above was changed.
+1. **Transfer at 40 threads:** the transfer scenario again, with the same settings except 40 threads instead of 200.
+2. **Hot-pair diagnostic:** the hot-pair scenario with GC logging on and the scheduled reconciliation off, to test the two leading explanations for the 503 bursts.
+
+**These runs did not start from the same point as the ones above:**
+- **Larger database:** both reused the database left by the four runs above. It held 335,710 transactions at the start, against about 10,000 when the original transfer run started. At the end it held 466,096 transactions and was 614 MB on disk, against Postgres's 128 MB `shared_buffers`.
+- **Fresh JVM:** the app container was restarted before each run.
+  - The transfer run started on the stopped stack.
+  - The diagnostic run needed the changed configuration, so it got a recreated container.
+  - Before the diagnostic run, a 60-second hot-pair warm-up warmed the new JVM. That warm-up is not reported: it produced 4,138 transactions, its ledger counts matched and reconciliation was healthy.
+- **Free RAM:** Windows had 2.2 GB of RAM free when these runs started.
+
+| Run | Threads | Measured | Requests | Throughput | p50 | p95 | p99 | Max | Status codes |
+|---|---|---|---|---|---|---|---|---|---|
+| Transfer, 1,000 accounts | 40 | 297.6 s | 96,172 | **323.2 req/s** | 108 ms | 235 ms | 342 ms | 1,653 ms | 201: 99.999%, 409: 0.001% (1) |
+| Hot pair, diagnostic | 200 | 299.6 s | 24,700 | **82.5 req/s** | 2,299 ms | 3,154 ms | 3,477 ms | 3,954 ms | 201: 97.826%, 503: 2.174% (537) |
+
+| Run | Transactions created (DB) | JMeter 201s, not replays (whole run) | Match | Reconciliation |
+|---|---|---|---|---|
+| Transfer, 40 threads | 99,193 | 99,193 | yes | healthy: 434,903 transactions, 869,806 entries, total 0.00 |
+| Hot pair, diagnostic | 27,055 | 27,055 | yes | healthy: 466,096 transactions, 932,192 entries, total 0.00 |
+
+| Run | Server-side mean | App CPU avg / max | Postgres CPU avg / max | Redis CPU avg / max |
+|---|---|---|---|---|
+| Transfer, 40 threads | 114.8 ms | 4.1 / 7.0 cores | 4.1 / 6.2 cores | 0.3 / 1.6 cores |
+| Hot pair, diagnostic | 2,288.8 ms | 0.8 / 2.0 | 0.8 / 1.7 | 0.2 / 1.1 |
+
+After both runs, all seven reconciliation checks had 0 failures, and `ledger.lock.retries` stayed at 0.
+
+### Transfer at 40 threads
+
+**Fewer threads gave lower latency and lower throughput.**
+- p50 was 108 ms against 405 ms at 200 threads, and p99 was 342 ms against 1,089 ms. Throughput was 323 req/s against 475.
+- Little's law gives 40 / 323.2 per second = 124 ms in the system. The app's own mean was 115 ms.
+
+**This is not a clean comparison with the 200-thread run.**
+- Compared with the original transfer run, both the app and Postgres used more CPU for each transfer:
+  - app: about 12.7 ms per transfer (4.1 cores / 323 per second), against 7.4 ms;
+  - Postgres: about 12.7 ms, against 8.8 ms.
+- Having fewer requests in flight should not make Postgres spend more CPU on each transfer, so something else had changed too. Two candidates:
+  - the database was about 33 times larger at the start;
+  - the app JVM had just restarted.
+- This run does not separate those two from the change in thread count. A clean comparison needs both thread counts on a freshly seeded database.
+
+**One request got a 409 `REQUEST_IN_PROGRESS`, which it should not have.**
+- Its key was a fresh UUID, and JMeter sent it only once (JMeter's HTTP retry count is 0).
+- Afterwards the key had no idempotency row, no transaction and no Redis entry. Nothing was posted, and the database count still equals JMeter's 201s.
+- The request took 1,653 ms, the longest in the run.
+- The code has one way to return 409 for a key that was sent once:
+  1. The Redis `SET NX` that marks the key IN_PROGRESS reached Redis and was applied, but the app saw it fail. The Redis command timeout is 200 ms.
+  2. The app then treated Redis as unavailable for 1s and checked Redis again.
+  3. That second check found the request's own IN_PROGRESS marker and answered 409.
+- The second check only reaches Redis if the 1-second skip window has passed, which fits a request that stalled for 1.65s.
+- **The mechanism is not confirmed.** Recreating the app container for the diagnostic run discarded this run's app log and its `ledger.redis.failures` counter, which would have shown the timeout.
+- **Impact:**
+  - Money is safe: nothing was posted.
+  - The client gets a wrong "still in progress" answer. Retrying with the same key gets 409 until the 10s IN_PROGRESS marker expires, and then succeeds.
+- **Fix:** this is a bug in the Redis fast path, not in the ledger. The fix is to keep the marker token even when `SET NX` reports a failure, and to treat an IN_PROGRESS entry carrying that token as the request's own. It is not part of this change.
+
+### Hot-pair diagnostic
+
+**Configuration.** This run used the same image as the original hot-pair run, with an overlay (`loadtest/compose-diagnostic.yml`):
+- GC and safepoint logging on (`-Xlog:gc*,safepoint`);
+- scheduled reconciliation off. The app log confirms it: its only reconciliation lines are the two that `run.sh` requested;
+- the Hikari pool's active and pending connections recorded about every 2 seconds, from the actuator.
+
+**The bursts did not disappear. There were more of them: 537 503s in 12 bursts, against 115 in 2.**
+
+| Window (30 s) | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Original hot pair: 201/s | 92 | 109 | 105 | 109 | 108 | **94** | 109 | 111 | 108 | 109 | 107 |
+| Original hot pair: 503s | 1 | 0 | 0 | 0 | 0 | **115** | 0 | 0 | 0 | 0 | 0 |
+| Diagnostic: 201/s | 90 | **71** | 80 | 87 | 83 | **80** | 86 | 89 | 88 | **70** | **78** |
+| Diagnostic: 503s | 0 | **156** | 1 | 0 | 0 | **63** | 0 | 0 | 0 | **203** | **114** |
+
+Window 0 is the ramp-up; it is counted here but not in the main results.
+
+**Ruled out as the cause:**
+- **Scheduled reconciliation:** it was off, and the bursts still happened.
+- **GC:** the log has 220 pauses, the longest 39.8 ms. No safepoint took over 50 ms, and the longest pause in or next to a burst second was 30.6 ms. A 503 needs a request to wait 3 seconds, so pauses of that size don't explain it.
+
+**What the data shows:**
+- **The pool was full for the whole run.** In 133 of the 134 samples in the measured window, all 20 connections were active and 179 requests were waiting for one. The other sample showed 7 active and none waiting.
+- **The queue wait sits close to the timeout.** With about 180 requests waiting at about 85 per second, a request waits about 2.1s for a connection, against a 3s `connection-timeout`. Little's law agrees: 200 / 82.5 = 2.42s in the system, and the app's mean was 2.29s.
+- **So a short dip causes a burst.** A few seconds of lower throughput push the requests already waiting past 3s together, which shows up as a burst. Every 30-second window with 503s had a throughput dip, in this run and in the original hot-pair run.
+- **The margin explains the difference between the runs:**
+  - The original run did about 108 transfers a second, so the wait was about 1.7s, with 1.3s of margin.
+  - The diagnostic run did about 85 a second, which leaves about 0.9s of margin.
+  - So more dips crossed the line: 12 bursts against 2.
+
+**Not established:**
+- **What causes the dips.** Two pieces of evidence point at the machine rather than the app:
+  - *Redis:* Redis is single-threaded and spends microseconds on a GET or SET, yet its slowlog recorded GETs and SETs taking 10-87 ms inside Redis. A process that slow on trivial work is waiting for CPU.
+    - During this run it recorded four, at 06:05:59, 06:06:38, 06:06:43 and 06:06:44 UTC.
+    - Each is within a second of a burst: 06:06:00, 06:06:39-41 and 06:06:44-46.
+  - *Postgres:* one burst, at 06:02:16-21, starts a second after a Postgres checkpoint began.
+
+  Neither covers every burst.
+- **Why the baseline was lower.** The run managed about 85/s against 108/s, so the lock hold per successful transfer was about 12.4 ms against 9.4 ms. This run doesn't explain the difference. It differed from the original in three ways:
+  - the database was about 50% larger: 439,041 transactions at the start against 300,927;
+  - the JVM had about 1.5 minutes of load behind it, against about 15;
+  - GC logging was on. Writing a GC log to a file costs very little, so this is the least likely of the three.
+
+**Conclusion.**
+- **Cause:** in the hot-pair scenario, 503s are a margin problem. When about 180 requests queue for 20 connections, the queue wait is within about a second of the 3-second timeout, and short stalls on this machine push groups of requests over it. GC and the scheduled reconciliation are not the cause.
+- **Options, none applied:**
+  - limit how many requests can wait on one hot account;
+  - reduce the time a transfer holds the row lock;
+  - lengthen `connection-timeout`, which turns 503s into longer waits.
+
+  Choosing among them is a design decision. Changing the settings of these runs would only hide the problem.
+
 ## Caveats
 
+- **JMeter ran on the same machine as the stack and competed with it for CPU.**
+  - The Docker VM's 12 CPUs are the laptop's 12 logical CPUs, and JMeter's threads ran on those same CPUs.
+  - JMeter's own CPU use was not measured, so every number here includes whatever JMeter took from the app, Postgres and Redis.
+- **Memory was tight.**
+  - Windows had only 1.8 GB of RAM free at the start of the original runs, and 2.2 GB at the start of the additional runs.
+  - The Docker VM was allowed up to 7.46 GiB.
+  - Memory pressure on the host is one possible source of the stalls described above. It was not measured.
 - **One laptop runs everything:** load generator, app, database and cache share the same CPUs and memory. On separate machines the numbers would differ, probably with higher throughput and lower latency.
 - **Two network hops:** JMeter reaches the app through Docker Desktop's port forward on Windows, which adds latency (about 11 ms on an idle request) that a real deployment wouldn't have.
 - **Fixed amounts:** amounts were random from 1.00 to 10.00 against 1,00,000.00 balances, so no transfer was refused for lack of funds. These runs measure throughput and correctness under concurrency, not business rejections.
@@ -139,6 +260,13 @@ loadtest/run.sh transfer     loadtest/ledger-transfer.jmx     -Jthreads=200 -Jra
 loadtest/run.sh hot-accounts loadtest/ledger-hot-accounts.jmx -Jthreads=200 -Jrampup=30 -Jduration=330
 loadtest/run.sh retry-storm  loadtest/ledger-retry-storm.jmx  -Jthreads=100 -Jrampup=30 -Jduration=210
 loadtest/run.sh hot-pair     loadtest/ledger-hot-accounts.jmx -Jthreads=200 -Jrampup=30 -Jduration=330 -JhotAccounts=2
+
+# additional runs
+loadtest/run.sh transfer-40  loadtest/ledger-transfer.jmx     -Jthreads=40  -Jrampup=30 -Jduration=330
+docker compose -f docker-compose.yml -f loadtest/compose-diagnostic.yml up -d app
+loadtest/run.sh hot-pair-diag-warmup loadtest/ledger-hot-accounts.jmx -Jthreads=200 -Jrampup=30 -Jduration=60 -JhotAccounts=2
+loadtest/run.sh hot-pair-diag        loadtest/ledger-hot-accounts.jmx -Jthreads=200 -Jrampup=30 -Jduration=330 -JhotAccounts=2
+docker compose cp app:/tmp/gc.log loadtest/report/hot-pair-diag/gc.log
 ```
 
 Each run writes `loadtest/report/<name>/`: `results.jtl`, `summary.json`, `reconciliation.json`, `docker-stats.csv`, and the HTML dashboard. That folder is gitignored.
