@@ -74,7 +74,9 @@ ledger:
   reconciliation:
     scheduled-enabled: true
     interval-ms: 300000
+    # scans the whole ledger, so it gets longer than the 5s every pooled connection starts with
+    statement-timeout: 60s
 
 logging:
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{correlationId}] [%X{txnId}] %logger{36} - %msg%n"
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{correlationId}] [%X{idempotencyKey}] [%X{txnId}] %logger{36} - %msg%n"

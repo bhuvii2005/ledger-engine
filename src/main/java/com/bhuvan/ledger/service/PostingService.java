@@ -24,6 +24,7 @@ import jakarta.persistence.EntityManager;
 import java.util.List;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -38,6 +39,8 @@ import org.springframework.transaction.annotation.Transactional;
 @Slf4j
 @Service
 public class PostingService {
+
+    static final String MDC_TXN_ID = "txnId";
 
     private final AccountRepository accountRepository;
     private final IdempotencyRecordRepository idempotencyRepository;
@@ -65,6 +68,15 @@ public class PostingService {
 
     @Transactional
     public PostingResult post(PostingCommand cmd) {
+        try {
+            return claimAndPost(cmd);
+        } finally {
+            // set by move() once the new transaction has an id; a retry or the next request starts clean
+            MDC.remove(MDC_TXN_ID);
+        }
+    }
+
+    private PostingResult claimAndPost(PostingCommand cmd) {
         boolean claimed = idempotencyRepository.claim(
                 cmd.idempotencyKey(), cmd.requestHash(), cmd.operation().name()) == 1;
         IdempotencyRecord record = idempotencyRepository.findById(cmd.idempotencyKey())
@@ -173,6 +185,7 @@ public class PostingService {
                 .idempotencyKey(cmd.idempotencyKey())
                 .reversesTxnId(cmd.reversesTxnId())
                 .build();
+        MDC.put(MDC_TXN_ID, txn.getId().toString());
         // persist, not repository.save: the id is assigned, so save() would merge and SELECT first
         entityManager.persist(txn);
         entityManager.persist(LedgerEntry.builder().transactionId(txn.getId()).accountId(source.getId())

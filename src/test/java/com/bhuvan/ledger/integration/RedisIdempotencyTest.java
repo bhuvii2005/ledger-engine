@@ -7,6 +7,7 @@ import com.bhuvan.ledger.AbstractIntegrationTest;
 import com.bhuvan.ledger.LedgerInvariants;
 import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.service.AccountService;
+import com.bhuvan.ledger.service.ReconciliationService;
 import com.bhuvan.ledger.service.IdempotencyCache;
 import com.bhuvan.ledger.service.PostingCommand;
 import com.bhuvan.ledger.service.PostingResult;
@@ -64,6 +65,9 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
     private JdbcTemplate jdbc;
 
     @Autowired
+    private ReconciliationService reconciliation;
+
+    @Autowired
     private EntityManagerFactory entityManagerFactory;
 
     @Autowired
@@ -78,7 +82,7 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        ledger = new LedgerInvariants(jdbc);
+        ledger = new LedgerInvariants(jdbc, reconciliation);
         a = accountWith(100_000); // 1,000.00
         b = accountWith(0);
     }
@@ -304,7 +308,7 @@ class RedisIdempotencyTest extends AbstractIntegrationTest {
         assertThat(redisEntry(key).get("state").asText()).isEqualTo("COMPLETED"); // refilled from Postgres
         assertThat(transactionsWithKey(key)).isEqualTo(1);
         assertThat(ledger.balance(b)).isEqualTo(1_000);
-        ledger.assertHealthy(List.of(a, b));
+        ledger.assertHealthy();
     }
 
     // ---------- helpers ----------

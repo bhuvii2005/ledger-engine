@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -16,14 +17,16 @@ import static org.mockito.Mockito.when;
 import com.bhuvan.ledger.entity.TransactionType;
 import com.bhuvan.ledger.exception.ErrorCode;
 import com.bhuvan.ledger.exception.LedgerException;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.SQLException;
 import java.util.Optional;
 import java.util.UUID;
+import org.hibernate.exception.ConstraintViolationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
-import org.hibernate.exception.ConstraintViolationException;
+import org.slf4j.MDC;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
@@ -201,6 +204,107 @@ class TransactionFacadeTest {
         when(postingService.post(any())).thenThrow(uniqueViolation("transactions_reverses_txn_id_key"));
 
         assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    // ---------- metrics ----------
+
+    @Test
+    void newPostingIsCountedAsCreated() {
+        when(postingService.post(cmd)).thenReturn(ok);
+        facade.execute(cmd);
+        assertThat(postings("TRANSFER", "created")).isEqualTo(1);
+        assertThat(replays("redis") + replays("db")).isZero();
+    }
+
+    @Test
+    void storedBusinessRejectionIsCountedAsRejected() {
+        when(postingService.post(cmd)).thenReturn(new PostingResult(422, "{}", null, false));
+        facade.execute(cmd);
+        assertThat(postings("TRANSFER", "rejected")).isEqualTo(1);
+    }
+
+    @Test
+    void redisReplayIsCountedWithSourceRedis() {
+        when(cache.lookup(cmd)).thenReturn(Optional.of(new PostingResult(201, "{}", UUID.randomUUID(), true)));
+        facade.execute(cmd);
+        assertThat(replays("redis")).isEqualTo(1);
+        assertThat(replays("db")).isZero();
+        assertThat(postings("TRANSFER", "replayed")).isEqualTo(1);
+    }
+
+    @Test
+    void replayAfterLosingTheSetNxRaceIsStillSourceRedis() {
+        when(cache.tryMarkInProgress(cmd)).thenReturn(Optional.empty());
+        when(cache.lookup(cmd))
+                .thenReturn(Optional.empty())
+                .thenReturn(Optional.of(new PostingResult(201, "{}", UUID.randomUUID(), true)));
+        facade.execute(cmd);
+        assertThat(replays("redis")).isEqualTo(1);
+    }
+
+    @Test
+    void postgresReplayIsCountedWithSourceDb() {
+        when(postingService.post(cmd)).thenReturn(new PostingResult(201, "{}", UUID.randomUUID(), true));
+        facade.execute(cmd);
+        assertThat(replays("db")).isEqualTo(1);
+        assertThat(replays("redis")).isZero();
+        assertThat(postings("TRANSFER", "replayed")).isEqualTo(1);
+    }
+
+    @Test
+    void inProgressAndKeyReuseAreCountedAsConflicts() {
+        when(cache.lookup(cmd)).thenThrow(new LedgerException(ErrorCode.REQUEST_IN_PROGRESS, "busy"));
+        assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(LedgerException.class);
+
+        PostingCommand other = PostingCommand.of(TransactionType.DEPOSIT, "key-reused01", "SYS-CASH-0001",
+                "ACC1000000001", 100, "INR", null, null);
+        when(postingService.post(other)).thenThrow(new LedgerException(ErrorCode.IDEMPOTENCY_KEY_REUSED, "x"));
+        assertThatThrownBy(() -> facade.execute(other)).isInstanceOf(LedgerException.class);
+
+        assertThat(postings("TRANSFER", "conflict")).isEqualTo(1);
+        assertThat(postings("DEPOSIT", "conflict")).isEqualTo(1);
+    }
+
+    @Test
+    void systemBusyAndUnexpectedFailuresAreCountedAsErrors() {
+        when(postingService.post(any())).thenThrow(new PessimisticLockingFailureException("lock timeout"));
+        assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(LedgerException.class);
+        assertThat(postings("TRANSFER", "error")).isEqualTo(1);
+
+        doThrow(new IllegalStateException("bug")).when(postingService).post(any());
+        assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(IllegalStateException.class);
+        assertThat(postings("TRANSFER", "error")).isEqualTo(2);
+    }
+
+    // ---------- logging context ----------
+
+    @Test
+    void idempotencyKeyIsInTheLogContextWhilePostingAndClearedAfter() {
+        String[] seen = new String[1];
+        when(postingService.post(cmd)).thenAnswer(inv -> {
+            seen[0] = MDC.get("idempotencyKey");
+            return ok;
+        });
+        facade.execute(cmd);
+        assertThat(seen[0]).isEqualTo("key-12345678");
+        assertThat(MDC.get("idempotencyKey")).isNull();
+    }
+
+    @Test
+    void idempotencyKeyIsClearedEvenWhenPostingFails() {
+        when(postingService.post(any())).thenThrow(new IllegalStateException("bug"));
+        assertThatThrownBy(() -> facade.execute(cmd)).isInstanceOf(IllegalStateException.class);
+        assertThat(MDC.get("idempotencyKey")).isNull();
+    }
+
+    private double postings(String type, String result) {
+        Counter c = registry.find("ledger.postings").tags("type", type, "result", result).counter();
+        return c == null ? 0 : c.count();
+    }
+
+    private double replays(String source) {
+        Counter c = registry.find("ledger.idempotency.replays").tag("source", source).counter();
+        return c == null ? 0 : c.count();
     }
 
     private static DataIntegrityViolationException uniqueViolation(String constraint) {

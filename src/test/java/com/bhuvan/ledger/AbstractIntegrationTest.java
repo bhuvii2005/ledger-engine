@@ -55,6 +55,8 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.jpa.properties.hibernate.generate_statistics", () -> "true");
         registry.add("logging.level.org.hibernate.engine.internal.StatisticalLoggingSessionEventListener",
                 () -> "WARN");
+        // tests call ReconciliationService directly; a background run would only add noise
+        registry.add("ledger.reconciliation.scheduled-enabled", () -> "false");
     }
 
     protected static void stopRedis() {
