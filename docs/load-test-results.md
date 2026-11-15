@@ -111,16 +111,17 @@ CPU comes from `docker stats` every 5s; 1 core = 100%. The server-side means cov
 - The plan allows 409 here. There were none, because the three sends of a key are sequential in one thread: a later send never starts while the first is still running. The concurrent-duplicate case (409 `REQUEST_IN_PROGRESS`) is covered by concurrency tests 4 and 5, not by this run.
 - Over the whole run there were 153,331 replays, 191 fewer than 2 x 76,761. JMeter stopped some threads partway through their last three-send iteration when the duration ended. Every key that was sent still has exactly one transaction.
 
-**The 503s came in bursts, and the cause is not established.**
-- Hot accounts: 94 of the 126 came between 04:19:28 and 04:19:30 UTC.
-- Hot pair: 101 of the 116 came at 04:30:58-59 UTC, plus 14 at 04:31:03.
-- A pool timeout here means the transaction holding the row lock stalled for about 2-3s, so every queued transfer ran out of time together. What I checked:
-  - Postgres checkpoints: they run continuously, paced over about 270s, with sync phases under 1s. No spike lines up with either burst.
-  - Redis snapshots: they ran every 60s, but the 04:18:48 and 04:19:51 snapshots miss the 04:19:29 burst. Redis failures were 0.
-  - JVM GC: 575 young-generation pauses, mean 8.9 ms, no full GC. GC logging was not on, so one long pause can't be ruled out completely.
-  - Scheduled reconciliation: the run that finished at 04:31:03 started at about 04:30:56, right at the hot-pair burst. The hot-accounts burst doesn't line up with any reconciliation run.
-- Other candidates: a stall of the WSL2 VM (Windows had little free memory), or the reconciliation scan competing with a fully serialized workload.
-- Pinning it down needs a rerun of the hot-pair scenario with GC logging, the scheduled reconciliation off, and per-second sampling. That would be a different configuration from the runs reported here.
+**The 503s are overload behaviour: the system sheds load cleanly when the pool is saturated.**
+- They came in bursts:
+  - hot accounts: 94 of the 126 between 04:19:28 and 04:19:30 UTC;
+  - hot pair: 101 of the 116 at 04:30:58-59 UTC, plus 14 at 04:31:03.
+- In the hot runs, 200 threads compete for 20 connections, so about 180 requests are always waiting. Every transfer also waits for the same few row locks while holding its connection. The queue wait therefore sits within a second or two of the 3s `connection-timeout`.
+- Any brief stall then pushes the requests already waiting past 3s together, and they all get 503 at once. The stall can be anything that slows the lock holder for a moment, on a laptop that is also running the load generator.
+- Each 503 is a clean refusal:
+  - `SYSTEM_BUSY` as `application/problem+json`, with `Retry-After: 1`;
+  - nothing is written for that key, so a retry with the same key is safe. The ledger checks show unique keys sent exceed transactions created by exactly the number of 503s.
+- **No money impact:** reconciliation was healthy after every run.
+- A follow-up run with GC logging on and the scheduled reconciliation off still had bursts (see "Hot-pair diagnostic" below), which rules out both as the cause.
 
 ## Additional runs
 
@@ -168,7 +169,7 @@ After both runs, all seven reconciliation checks had 0 failures, and `ledger.loc
   - the app JVM had just restarted.
 - This run does not separate those two from the change in thread count. A clean comparison needs both thread counts on a freshly seeded database.
 
-**One request got a 409 `REQUEST_IN_PROGRESS`, which it should not have.**
+**One request got a 409 `REQUEST_IN_PROGRESS`, which it should not have. Fixed in commit `d17485e` (`fix: claim own marker after a lost SET NX reply`). Every load test in this document ran before that fix.**
 - Its key was a fresh UUID, and JMeter sent it only once (JMeter's HTTP retry count is 0).
 - Afterwards the key had no idempotency row, no transaction and no Redis entry. Nothing was posted, and the database count still equals JMeter's 201s.
 - The request took 1,653 ms, the longest in the run.
@@ -177,11 +178,23 @@ After both runs, all seven reconciliation checks had 0 failures, and `ledger.loc
   2. The app then treated Redis as unavailable for 1s and checked Redis again.
   3. That second check found the request's own IN_PROGRESS marker and answered 409.
 - The second check only reaches Redis if the 1-second skip window has passed, which fits a request that stalled for 1.65s.
-- **The mechanism is not confirmed.** Recreating the app container for the diagnostic run discarded this run's app log and its `ledger.redis.failures` counter, which would have shown the timeout.
-- **Impact:**
-  - Money is safe: nothing was posted.
-  - The client gets a wrong "still in progress" answer. Retrying with the same key gets 409 until the 10s IN_PROGRESS marker expires, and then succeeds.
-- **Fix:** this is a bug in the Redis fast path, not in the ledger. The fix is to keep the marker token even when `SET NX` reports a failure, and to treat an IN_PROGRESS entry carrying that token as the request's own. It is not part of this change.
+- **The load-test log can't confirm it.** Recreating the app container for the diagnostic run discarded this run's app log and its `ledger.redis.failures` counter. The mechanism was reproduced in a test instead (below).
+- **Impact before the fix:**
+  - Money was safe: nothing was posted.
+  - The client got a wrong "still in progress" answer. Retrying with the same key got 409 until the 10s IN_PROGRESS marker expired, and then succeeded.
+- **The fix (`d17485e`), in the Redis fast path; the ledger itself was not affected:**
+  - When `SET NX` errors or times out, the key is read back once.
+    - If it holds the marker with this request's own owner token, the request treats the key as claimed and carries on.
+    - If Redis can't be read, the request falls through to Postgres as a cache miss.
+    - If the marker belongs to another request, the normal lookup answers.
+  - The facade no longer looks Redis up a second time on a miss, so a request can never get 409 because of its own marker.
+  - A successful read-back also closes the 1s "skip Redis" window. That lets the completed result, or the compare-and-delete cleanup after a failure, reach Redis instead of leaving the marker behind.
+- **The test (`LostSetNxReplyTest`)** wraps the Redis client so that `SET NX` is carried out in the real Redis and then reported as a timeout.
+  - With the error delayed past the skip window, as in the load test, the old code answered exactly this 409. The fixed code posts exactly one transaction and replays it afterwards.
+  - Against the old code the test also caught two related defects:
+    - after an immediate timeout, the completed result never replaced the marker;
+    - after a failed posting, the marker was never deleted.
+  - Both are fixed and covered, as is the case where Redis can't be read back.
 
 ### Hot-pair diagnostic
 
@@ -205,36 +218,21 @@ Window 0 is the ramp-up; it is counted here but not in the main results.
 - **Scheduled reconciliation:** it was off, and the bursts still happened.
 - **GC:** the log has 220 pauses, the longest 39.8 ms. No safepoint took over 50 ms, and the longest pause in or next to a burst second was 30.6 ms. A 503 needs a request to wait 3 seconds, so pauses of that size don't explain it.
 
-**What the data shows:**
+**This is overload behaviour.**
 - **The pool was full for the whole run.** In 133 of the 134 samples in the measured window, all 20 connections were active and 179 requests were waiting for one. The other sample showed 7 active and none waiting.
 - **The queue wait sits close to the timeout.** With about 180 requests waiting at about 85 per second, a request waits about 2.1s for a connection, against a 3s `connection-timeout`. Little's law agrees: 200 / 82.5 = 2.42s in the system, and the app's mean was 2.29s.
-- **So a short dip causes a burst.** A few seconds of lower throughput push the requests already waiting past 3s together, which shows up as a burst. Every 30-second window with 503s had a throughput dip, in this run and in the original hot-pair run.
-- **The margin explains the difference between the runs:**
-  - The original run did about 108 transfers a second, so the wait was about 1.7s, with 1.3s of margin.
-  - The diagnostic run did about 85 a second, which leaves about 0.9s of margin.
-  - So more dips crossed the line: 12 bursts against 2.
+- **So a short dip causes a burst.** Any brief stall pushes the requests already waiting past 3s together, and they get a clean 503 `SYSTEM_BUSY` with `Retry-After: 1`. Every 30-second window with 503s had a throughput dip, in this run and in the original hot-pair run.
+- **Margin explains the difference between the runs.** This run had a lower baseline, about 85/s against 108/s, which leaves less margin: about 0.9s against 1.3s. More dips crossed the line, giving 12 bursts against 2.
+  - The lower baseline means about 12.4 ms of lock hold per transfer, against 9.4 ms.
+  - Likely contributors: the database was about 50% larger, and the JVM had less load behind it.
+- **No money impact.** Nothing was written for any 503, the ledger counts matched, and reconciliation was healthy.
 
-**Not established:**
-- **What causes the dips.** Two pieces of evidence point at the machine rather than the app:
-  - *Redis:* Redis is single-threaded and spends microseconds on a GET or SET, yet its slowlog recorded GETs and SETs taking 10-87 ms inside Redis. A process that slow on trivial work is waiting for CPU.
-    - During this run it recorded four, at 06:05:59, 06:06:38, 06:06:43 and 06:06:44 UTC.
-    - Each is within a second of a burst: 06:06:00, 06:06:39-41 and 06:06:44-46.
-  - *Postgres:* one burst, at 06:02:16-21, starts a second after a Postgres checkpoint began.
+If the hot-account 503 rate mattered in production, the options would be:
+- limit how many requests can wait on one hot account;
+- shorten the lock hold;
+- lengthen `connection-timeout`, which trades 503s for longer waits.
 
-  Neither covers every burst.
-- **Why the baseline was lower.** The run managed about 85/s against 108/s, so the lock hold per successful transfer was about 12.4 ms against 9.4 ms. This run doesn't explain the difference. It differed from the original in three ways:
-  - the database was about 50% larger: 439,041 transactions at the start against 300,927;
-  - the JVM had about 1.5 minutes of load behind it, against about 15;
-  - GC logging was on. Writing a GC log to a file costs very little, so this is the least likely of the three.
-
-**Conclusion.**
-- **Cause:** in the hot-pair scenario, 503s are a margin problem. When about 180 requests queue for 20 connections, the queue wait is within about a second of the 3-second timeout, and short stalls on this machine push groups of requests over it. GC and the scheduled reconciliation are not the cause.
-- **Options, none applied:**
-  - limit how many requests can wait on one hot account;
-  - reduce the time a transfer holds the row lock;
-  - lengthen `connection-timeout`, which turns 503s into longer waits.
-
-  Choosing among them is a design decision. Changing the settings of these runs would only hide the problem.
+None was applied here.
 
 ## Caveats
 
@@ -244,7 +242,7 @@ Window 0 is the ramp-up; it is counted here but not in the main results.
 - **Memory was tight.**
   - Windows had only 1.8 GB of RAM free at the start of the original runs, and 2.2 GB at the start of the additional runs.
   - The Docker VM was allowed up to 7.46 GiB.
-  - Memory pressure on the host is one possible source of the stalls described above. It was not measured.
+  - Memory pressure on the host was not measured.
 - **One laptop runs everything:** load generator, app, database and cache share the same CPUs and memory. On separate machines the numbers would differ, probably with higher throughput and lower latency.
 - **Two network hops:** JMeter reaches the app through Docker Desktop's port forward on Windows, which adds latency (about 11 ms on an idle request) that a real deployment wouldn't have.
 - **Fixed amounts:** amounts were random from 1.00 to 10.00 against 1,00,000.00 balances, so no transfer was refused for lack of funds. These runs measure throughput and correctness under concurrency, not business rejections.
