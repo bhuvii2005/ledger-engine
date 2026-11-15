@@ -11,7 +11,7 @@ Every money movement is one database transaction that writes a balanced pair of 
 
 ## Status
 
-All the planned phases are complete:
+Built so far:
 - the posting engine with pessimistic locking and database-backed idempotency;
 - the Redis idempotency cache with a Postgres fallback;
 - reversals, account statements, and freezing or closing accounts;
@@ -102,6 +102,8 @@ curl localhost:8080/actuator/health
 
 If port 5432 is already taken on your machine (for example by a local Postgres), set `DB_HOST_PORT=55432` in a `.env` file or in the environment. The app reaches Postgres inside the compose network either way.
 
+On a fresh database, the first two accounts get the numbers ACC1000000001 and ACC1000000002.
+
 Create two accounts, deposit into one, then transfer between them:
 
 ```
@@ -183,7 +185,7 @@ The method, every run's numbers, the analysis and the caveats are in [docs/load-
 ## Limitations
 
 - **Hot-account ceiling.** All transfers touching one account are serialized by its row lock. One pair of accounts manages about 107 transfers/s on this laptop. The system account takes part in every deposit and withdrawal, so it is a hot account by design.
-- **Load shedding under pool saturation.** When more requests are waiting than the 20-connection pool can serve, a request that waits more than 3s for a connection gets 503 `SYSTEM_BUSY` with `Retry-After: 1`. Nothing is written for it, so a retry with the same key is safe. Under hot-account load this happened to 0.2-2.2% of requests, depending on the run.
+- **Load shedding under pool saturation.** When more requests are waiting than the 20-connection pool can serve, a request that waits more than 3s for a connection gets 503 `SYSTEM_BUSY` with `Retry-After: 1`. Nothing is written for it, so a retry with the same key is safe. Under hot-account load this happened to 0.2-0.4% of requests in the runs above, and 2.2% in a diagnostic rerun (see [docs/load-test-results.md](docs/load-test-results.md)).
 - **Global idempotency keys.** Keys are unique across all clients, not scoped per client, and the key decides whether a request is new. With authentication, keys would be scoped by client id.
 - **No authentication or authorization.** Any caller can move money between any accounts, and the admin endpoint is open.
 - **Single node.** One app instance and one Postgres, with no replication, sharding or failover.
@@ -205,7 +207,7 @@ The method, every run's numbers, the analysis and the caveats are in [docs/load-
 - Green tests don't mean correct. My end-of-suite reconciliation passed but only counted 293 transactions, when one test alone posts about 1,900. An old test was wiping the shared database halfway through the run. I only caught it because the number looked too small.
 - A timeout doesn't mean the write failed. One request in about 99,000 got a wrong 409: Redis had saved my "in progress" marker, but the reply timed out, so the app rejected its own request. Reading the key back and checking the owner token fixed it, and the test I wrote for it found two more cleanup bugs.
 - Where the transaction starts and ends matters a lot. The retry loop has to sit outside the transaction, a @Transactional method called from its own class gets no transaction, and loading an account before locking it means working with stale data.
-- On a hot account, throughput is set by how long the lock is held. The same test went from about 53/s to about 107/s just by running the app next to Postgres, because about nine round trips happen while the lock is held.
+- On a hot account, throughput is set by how long the lock is held. The same one-pair test ran at about 53/s from the test suite and about 107/s with the app next to Postgres; about nine database round trips happen while the lock is held, and they explain much of that gap.
 - Don't trust a tool's numbers blindly. JMeter's HTML report calculates percentiles from only the last 20,000 samples. I noticed because my own numbers from the raw file didn't match.
 
 ## License
