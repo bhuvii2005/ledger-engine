@@ -6,7 +6,9 @@ services:
       POSTGRES_USER: ${DB_USER:-ledger}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-ledger}
     ports:
-      - "5432:5432"
+      # host side is configurable for machines that already run Postgres on 5432;
+      # the app inside compose always reaches it as postgres:5432
+      - "${DB_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
